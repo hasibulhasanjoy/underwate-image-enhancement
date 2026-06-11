@@ -1,0 +1,132 @@
+# ============================================================
+# P-UWDM Thesis Project — .gitignore
+# Python / PyTorch / Deep Learning / Windows
+# ============================================================
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# ------------------------------------------------------------
+# Jupyter Notebooks
+# ------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ------------------------------------------------------------
+# Deep Learning / PyTorch
+# ------------------------------------------------------------
+# Model checkpoints & weights (can be large)
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.h5
+*.hdf5
+*.safetensors
+
+# Training logs & runs
+runs/
+logs/
+wandb/
+mlruns/
+lightning_logs/
+tensorboard/
+
+# Cached feature maps / embeddings
+*.npy
+*.npz
+*.bin
+
+# ------------------------------------------------------------
+# Datasets (never commit raw data)
+# ------------------------------------------------------------
+dataset/
+
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+!src/data/
+
+# ------------------------------------------------------------
+# Generated outputs
+# ------------------------------------------------------------
+results/
+output/
+outputs/
+samples/
+enhanced/
+visualizations/
+figures/generated/
+
+# Keep these tracked (example overrides below)
+# !figures/paper/          # uncomment to track paper figures
+
+# ------------------------------------------------------------
+# IDE / Editor
+# ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ------------------------------------------------------------
+# Windows
+# ------------------------------------------------------------
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# ------------------------------------------------------------
+# Environment & secrets
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+secrets.yaml
+config/local.yaml
+
+# ------------------------------------------------------------
+# Misc
+# ------------------------------------------------------------
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+.cache/
+.hypothesis/
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
