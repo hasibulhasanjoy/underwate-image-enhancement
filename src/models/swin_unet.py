@@ -11,36 +11,26 @@ Architecture overview
 
     Conditioning signals (all (B, *)):
        - t              : diffusion timestep scalar (B,)
-       - ambient        : (B, 3)   from A-Net
-       - transmission   : (B, 1, H, W) from T-Net
-       - degradation    : (B, 6)   from degradation estimator
-       - severity       : (B, 1)   from degradation estimator
+       - a_embedding    : (B, 128)  from A-Net          ← Phase 3 change
+       - t_embedding    : (B, 128)  from T-Net           ← Phase 3 change
+       - degradation    : (B, 6)    from degradation estimator (unchanged)
+       - severity       : (B, 1)    from degradation estimator (unchanged)
 
-    Stem
-       PatchEmbed (patch_size=4): (B,3,H,W) → (B, H/4·W/4, C0)
+    [All other architecture details unchanged from Phase 2]
 
-    Encoder (3 stages + downsampling between each)
-       Stage 0:  C0,  depth d0, num_heads h0   →  skip_0
-       PatchMerge → C1
-       Stage 1:  C1,  depth d1, num_heads h1   →  skip_1
-       PatchMerge → C2
-       Stage 2:  C2,  depth d2, num_heads h2   →  skip_2
-       PatchMerge → C3
+Phase 3 changes (conditioning networks integration)
+----------------------------------------------------
+Previously the denoiser accepted raw physics estimates:
+    ambient      (B, 3)        → projected via Linear(3, 64)
+    transmission (B, 1, H, W)  → reduced to mean+std (B, 2) → Linear(2, 64)
 
-    Bottleneck
-       Stage 3:  C3,  depth d3, num_heads h3
+Now it accepts learned embeddings from A-Net and T-Net:
+    a_embedding  (B, 128)  → projected via Linear(128, 128)
+    t_embedding  (B, 128)  → projected via Linear(128, 128)
 
-    Decoder (3 stages + upsampling between each, with skip fusions)
-       PatchExpand  → C2;  fuse skip_2 via ConvResBlock;  Stage 4
-       PatchExpand  → C1;  fuse skip_1 via ConvResBlock;  Stage 5
-       PatchExpand  → C0;  fuse skip_0 via ConvResBlock;  Stage 6
-
-    Head
-       Final PatchExpand ×4 → (B, H, W, C0)
-       LayerNorm + Linear   → (B, H, W, 3)  predicted noise ε
-
-Default config (paper-scale, fits 24 GB VRAM at B=16, 256×256):
-    embed_dim=96, depths=[2,2,6,2], num_heads=[3,6,12,24], window_size=8
+ConditioningProjection in embeddings.py is updated accordingly.
+The total conditioning vector dimension (cond_dim=512) is unchanged.
+degradation and severity inputs are unchanged.
 """
 
 from __future__ import annotations
@@ -90,6 +80,8 @@ class SwinUNetConfig:
         proj_drop:     Projection dropout.
         sinusoidal_dim: Raw sinusoidal embedding dimension.
         cond_dim:      Unified conditioning vector dimension.
+        cond_embed_dim: Embedding dimension produced by A-Net and T-Net.
+                        Must match ANet(embed_dim=X) / TNet(embed_dim=X).
     """
 
     image_size: int = 256
@@ -104,6 +96,7 @@ class SwinUNetConfig:
     proj_drop: float = 0.0
     sinusoidal_dim: int = 256
     cond_dim: int = 512
+    cond_embed_dim: int = 128  # ← NEW: must match ANet/TNet embed_dim
 
     def __post_init__(self) -> None:
         assert len(self.depths) == 7, "depths must have 7 entries"
@@ -128,15 +121,21 @@ class SwinUNetDenoiser(nn.Module):
 
     Example::
 
-        cfg = SwinUNetConfig(image_size=256, embed_dim=96)
+        cfg   = SwinUNetConfig(image_size=256, embed_dim=96)
+        cond  = ConditioningNetworks(embed_dim=cfg.cond_embed_dim).cuda()
         model = SwinUNetDenoiser(cfg).cuda().to(torch.bfloat16)
+
+        # Run conditioning networks first:
+        cond_out = cond(raw, physics_A, physics_t)
+
+        # Then run denoiser:
         noise_pred = model(
-            x_t=noisy,          # (B, 3, 256, 256)
-            t=timesteps,        # (B,)  long
-            ambient=A,          # (B, 3)
-            transmission=T,     # (B, 1, 256, 256)
-            degradation=D,      # (B, 6)
-            severity=S,         # (B, 1)
+            x_t          = noisy,                    # (B, 3, 256, 256)
+            t            = timesteps,                # (B,)  long
+            a_embedding  = cond_out["a_embedding"],  # (B, 128)
+            t_embedding  = cond_out["t_embedding"],  # (B, 128)
+            degradation  = D,                        # (B, 6)
+            severity     = S,                        # (B, 1)
         )  # → (B, 3, 256, 256)
     """
 
@@ -153,8 +152,15 @@ class SwinUNetDenoiser(nn.Module):
         # ------------------------------------------------------------------ #
         self.time_embed = SinusoidalTimestepEmbedding(cfg.sinusoidal_dim)
         self.time_mlp = TimestepMLP(cfg.sinusoidal_dim, out_dim=cd)
-        self.phys_proj = ConditioningProjection(out_dim=cd)
-        # Final fusion: timestep + physics → single cond vector
+
+        # ← CHANGED: pass cond_embed_dim so ConditioningProjection knows the
+        #   input size for a_embedding and t_embedding.
+        self.phys_proj = ConditioningProjection(
+            out_dim=cd,
+            cond_embed_dim=cfg.cond_embed_dim,
+        )
+
+        # Final fusion: timestep + physics → single cond vector (unchanged)
         self.cond_fuse = nn.Sequential(
             nn.Linear(cd * 2, cd),
             nn.SiLU(),
@@ -173,7 +179,6 @@ class SwinUNetDenoiser(nn.Module):
         # ------------------------------------------------------------------ #
         # Encoder                                                             #
         # ------------------------------------------------------------------ #
-        # Channel dimensions: C → 2C → 4C → 8C
         self.enc_stage0 = SwinStage(
             cfg.depths[0],
             C,
@@ -227,9 +232,8 @@ class SwinUNetDenoiser(nn.Module):
         # ------------------------------------------------------------------ #
         # Decoder                                                             #
         # ------------------------------------------------------------------ #
-        # Each level: PatchExpand (halves channels) → ConvResBlock (fuse skip) → SwinStage
-        self.up2 = PatchExpand(C * 8)  # 8C → 4C
-        self.fuse2 = ConvResBlock(C * 8, C * 4)  # cat(skip C*4, up C*4) → C*4
+        self.up2 = PatchExpand(C * 8)
+        self.fuse2 = ConvResBlock(C * 8, C * 4)
         self.dec_stage2 = SwinStage(
             cfg.depths[4],
             C * 4,
@@ -241,8 +245,8 @@ class SwinUNetDenoiser(nn.Module):
             cfg.proj_drop,
         )
 
-        self.up1 = PatchExpand(C * 4)  # 4C → 2C
-        self.fuse1 = ConvResBlock(C * 4, C * 2)  # cat(skip C*2, up C*2) → C*2
+        self.up1 = PatchExpand(C * 4)
+        self.fuse1 = ConvResBlock(C * 4, C * 2)
         self.dec_stage1 = SwinStage(
             cfg.depths[5],
             C * 2,
@@ -254,8 +258,8 @@ class SwinUNetDenoiser(nn.Module):
             cfg.proj_drop,
         )
 
-        self.up0 = PatchExpand(C * 2)  # 2C → C
-        self.fuse0 = ConvResBlock(C * 2, C)  # cat(skip C, up C) → C
+        self.up0 = PatchExpand(C * 2)
+        self.fuse0 = ConvResBlock(C * 2, C)
         self.dec_stage0 = SwinStage(
             cfg.depths[6],
             C,
@@ -270,16 +274,12 @@ class SwinUNetDenoiser(nn.Module):
         # ------------------------------------------------------------------ #
         # Head: restore full spatial resolution                               #
         # ------------------------------------------------------------------ #
-        # After decoder stage0 we are at H/4, W/4 with dim C.
-        # We use two sequential ×2 PatchExpands to reach H, W (×4 total),
-        # finishing with C//4 channels.
-        self.up_head1 = PatchExpand(C)  # C → C//2  (×2)
-        self.up_head2 = PatchExpand(C // 2)  # C//2 → C//4  (×2)
+        self.up_head1 = PatchExpand(C)  # C   → C//2  (×2)
+        self.up_head2 = PatchExpand(C // 2)  # C//2 → C//4 (×2)
 
         self.head_norm = nn.LayerNorm(C // 4)
         self.head_proj = nn.Linear(C // 4, cfg.in_channels)
 
-        # Weight initialisation
         self.apply(self._init_weights)
 
     # ---------------------------------------------------------------------- #
@@ -309,62 +309,54 @@ class SwinUNetDenoiser(nn.Module):
     def _encode_conditioning(
         self,
         t: Tensor,  # (B,)
-        ambient: Tensor,  # (B, 3)
-        transmission: Tensor,  # (B, 1, H, W)
-        degradation: Tensor,  # (B, 6)
-        severity: Tensor,  # (B, 1)
+        a_embedding: Tensor,  # (B, cond_embed_dim)  from A-Net   ← CHANGED
+        t_embedding: Tensor,  # (B, cond_embed_dim)  from T-Net   ← CHANGED
+        degradation: Tensor,  # (B, 6)                            unchanged
+        severity: Tensor,  # (B, 1)                            unchanged
     ) -> Tensor:
-        """Build the unified (B, cond_dim) conditioning vector."""
+        """Build the unified (B, cond_dim) conditioning vector.
+
+        Changes from Phase 2
+        --------------------
+        Previously received raw ``ambient (B,3)`` and ``transmission (B,1,H,W)``
+        and reduced them inside ConditioningProjection.  Now receives the
+        128-dim learned embeddings from A-Net and T-Net directly.
+        """
         t_emb = self.time_embed(t)  # (B, sin_dim)
         t_cond = self.time_mlp(t_emb)  # (B, cond_dim)
         p_cond = self.phys_proj(
-            ambient, transmission, degradation, severity
+            a_embedding, t_embedding, degradation, severity
         )  # (B, cond_dim)
         cond = self.cond_fuse(torch.cat([t_cond, p_cond], dim=-1))  # (B, cond_dim)
         return cond
 
     # ---------------------------------------------------------------------- #
-    # Skip-connection fusion helper                                           #
+    # Skip-connection fusion helper (unchanged from Phase 2)                 #
     # ---------------------------------------------------------------------- #
 
     def _fuse_skip(
         self,
-        x: Tensor,  # (B, L, C_up)   upsampled
-        skip: Tensor,  # (B, L_skip, C_skip)  encoder feature
+        x: Tensor,
+        skip: Tensor,
         H_up: int,
         W_up: int,
         fuse_block: ConvResBlock,
         C_out: int,
     ) -> tuple[Tensor, int, int]:
-        """Spatial cat + ConvResBlock fusion.
-
-        Handles minor size mismatches between skip and upsampled tokens by
-        cropping the larger tensor (arises from odd-dimension padding in
-        PatchMerge / PatchExpand).
-
-        Returns:
-            fused: (B, H_up*W_up, C_out)
-            H_up, W_up: (unchanged)
-        """
         B = x.shape[0]
 
-        # Reshape both to spatial
-        x_sp = x.view(B, H_up, W_up, -1).permute(0, 3, 1, 2)  # (B, C, H, W)
-        H_s = round(skip.shape[1] ** 0.5)  # square assumption
+        x_sp = x.view(B, H_up, W_up, -1).permute(0, 3, 1, 2)
+        H_s = round(skip.shape[1] ** 0.5)
         W_s = skip.shape[1] // H_s
-        # More robust: derive from saved H/W (passed as context) – here we
-        # assume skip has the same resolution as x (they should after expand)
-        skip_sp = skip.view(B, H_s, W_s, -1).permute(0, 3, 1, 2)  # (B, C_skip, H, W)
+        skip_sp = skip.view(B, H_s, W_s, -1).permute(0, 3, 1, 2)
 
-        # Crop to minimum
-        H_min = min(H_up, H_s)
-        W_min = min(W_up, W_s)
+        H_min, W_min = min(H_up, H_s), min(W_up, W_s)
         x_sp = x_sp[:, :, :H_min, :W_min]
         skip_sp = skip_sp[:, :, :H_min, :W_min]
 
-        cat_sp = torch.cat([skip_sp, x_sp], dim=1)  # (B, C_skip+C_up, H, W)
-        fused = fuse_block(cat_sp)  # (B, C_out, H, W)
-        fused = fused.flatten(2).transpose(1, 2)  # (B, H*W, C_out)
+        cat_sp = torch.cat([skip_sp, x_sp], dim=1)
+        fused = fuse_block(cat_sp)
+        fused = fused.flatten(2).transpose(1, 2)
         return fused, H_min, W_min
 
     # ---------------------------------------------------------------------- #
@@ -375,69 +367,72 @@ class SwinUNetDenoiser(nn.Module):
         self,
         x_t: Tensor,  # (B, in_channels, H, W)  noisy image
         t: Tensor,  # (B,)  integer timestep
-        ambient: Tensor,  # (B, 3)
-        transmission: Tensor,  # (B, 1, H, W)
-        degradation: Tensor,  # (B, 6)
-        severity: Tensor,  # (B, 1)
+        a_embedding: Tensor,  # (B, cond_embed_dim)  from A-Net   ← CHANGED
+        t_embedding: Tensor,  # (B, cond_embed_dim)  from T-Net   ← CHANGED
+        degradation: Tensor,  # (B, 6)                            unchanged
+        severity: Tensor,  # (B, 1)                            unchanged
     ) -> Tensor:
         """Predict noise ε from noisy image x_t.
 
-        Returns:
-            eps_pred: (B, in_channels, H, W) predicted noise tensor.
+        Parameters
+        ----------
+        x_t         : (B, 3, H, W) noisy image at timestep t
+        t           : (B,) integer diffusion timestep
+        a_embedding : (B, 128) ambient-light embedding from A-Net
+        t_embedding : (B, 128) transmission embedding from T-Net
+        degradation : (B, 6)   degradation feature vector (unchanged)
+        severity    : (B, 1)   degradation severity scalar (unchanged)
+
+        Returns
+        -------
+        eps_pred : (B, 3, H, W) predicted noise tensor
         """
         B, _, H_in, W_in = x_t.shape
 
         # ── Conditioning ─────────────────────────────────────────────────── #
         cond = self._encode_conditioning(
-            t, ambient, transmission, degradation, severity
+            t, a_embedding, t_embedding, degradation, severity
         )
 
         # ── Stem ─────────────────────────────────────────────────────────── #
-        x, H, W = self.patch_embed(x_t)  # (B, H/4·W/4, C)
+        x, H, W = self.patch_embed(x_t)
 
         # ── Encoder ──────────────────────────────────────────────────────── #
         x = self.enc_stage0(x, cond, H, W)
-        skip0 = x  # (B, H/4·W/4, C)
-        H0, W0 = H, W
+        skip0, H0, W0 = x, H, W
 
-        x, H, W = self.down0(x, H, W)  # (B, H/8·W/8, 2C)
+        x, H, W = self.down0(x, H, W)
         x = self.enc_stage1(x, cond, H, W)
-        skip1 = x
-        H1, W1 = H, W
+        skip1, H1, W1 = x, H, W
 
-        x, H, W = self.down1(x, H, W)  # (B, H/16·W/16, 4C)
+        x, H, W = self.down1(x, H, W)
         x = self.enc_stage2(x, cond, H, W)
-        skip2 = x
-        H2, W2 = H, W
+        skip2, H2, W2 = x, H, W
 
-        x, H, W = self.down2(x, H, W)  # (B, H/32·W/32, 8C)
+        x, H, W = self.down2(x, H, W)
 
         # ── Bottleneck ───────────────────────────────────────────────────── #
         x = self.bottleneck(x, cond, H, W)
 
         # ── Decoder ──────────────────────────────────────────────────────── #
-        # Level 2
-        x, H, W = self.up2(x, H, W)  # → 4C, H/16·W/16
+        x, H, W = self.up2(x, H, W)
         x, H, W = self._fuse_skip(x, skip2, H, W, self.fuse2, self.cfg.embed_dim * 4)
         x = self.dec_stage2(x, cond, H, W)
 
-        # Level 1
-        x, H, W = self.up1(x, H, W)  # → 2C, H/8·W/8
+        x, H, W = self.up1(x, H, W)
         x, H, W = self._fuse_skip(x, skip1, H, W, self.fuse1, self.cfg.embed_dim * 2)
         x = self.dec_stage1(x, cond, H, W)
 
-        # Level 0
-        x, H, W = self.up0(x, H, W)  # → C, H/4·W/4
+        x, H, W = self.up0(x, H, W)
         x, H, W = self._fuse_skip(x, skip0, H, W, self.fuse0, self.cfg.embed_dim)
         x = self.dec_stage0(x, cond, H, W)
 
-        # ── Head: ×4 upsample back to full resolution ─────────────────────── #
-        x, H, W = self.up_head1(x, H, W)  # → C//2, H/2·W/2
-        x, H, W = self.up_head2(x, H, W)  # → C//4, H·W
+        # ── Head ─────────────────────────────────────────────────────────── #
+        x, H, W = self.up_head1(x, H, W)
+        x, H, W = self.up_head2(x, H, W)
 
         x = self.head_norm(x)
-        x = self.head_proj(x)  # (B, H*W, 3)
-
+        x = self.head_proj(x)
         eps_pred = x.view(B, H_in, W_in, self.cfg.in_channels).permute(0, 3, 1, 2)
         return eps_pred
 
@@ -446,7 +441,6 @@ class SwinUNetDenoiser(nn.Module):
     # ---------------------------------------------------------------------- #
 
     def num_parameters(self, trainable_only: bool = True) -> int:
-        """Returns total (or trainable-only) parameter count."""
         params = (
             self.parameters()
             if not trainable_only
