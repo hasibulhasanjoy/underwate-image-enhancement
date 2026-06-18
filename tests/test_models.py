@@ -6,7 +6,7 @@ Run from project root:
 
 from __future__ import annotations
 
-import pytest
+import pytest  # type: ignore[import-not-found]
 import torch
 import torch.nn as nn
 
