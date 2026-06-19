@@ -244,13 +244,25 @@ class TestPerceptualLoss:
         assert x.grad is not None and x.grad.abs().sum().item() > 0
 
     def test_no_gradient_to_reference(self, imgs):
-        """Reference image should not accumulate gradients."""
+        """Reference image should not accumulate gradients.
+
+        Both enhanced and reference require grad so that loss.backward()
+        has a valid computation graph.  Only enhanced should receive a
+        gradient; reference features are computed under torch.no_grad()
+        inside PerceptualLoss, so ref.grad must remain None.
+        """
         perc = PerceptualLoss()
+        # Both need requires_grad=True so the loss has a grad_fn and
+        # backward() does not raise "does not require grad".
         ref = imgs["reference"].detach().requires_grad_(True)
-        x = imgs["enhanced"].detach()
+        x = imgs["enhanced"].detach().requires_grad_(True)
         loss = perc(x, ref)
         loss.backward()
-        # ref.grad should be None (torch.no_grad used internally)
+        # enhanced must receive a gradient (the model output path)
+        assert (
+            x.grad is not None and x.grad.abs().sum().item() > 0
+        ), "Enhanced image did not receive a gradient through perceptual loss"
+        # reference must NOT receive a gradient (features extracted under no_grad)
         assert (
             ref.grad is None or ref.grad.abs().sum().item() == 0.0
         ), "Reference image accumulated gradients through perceptual loss"
@@ -367,14 +379,59 @@ class TestContrastiveLoss:
         assert all(p.requires_grad for p in proj_params)
 
     def test_temperature_effect(self, imgs):
-        """Different temperatures should give different losses."""
+        """Temperature scaling must sharpen / flatten the similarity distribution.
+
+        We bypass the projection head and directly verify the NT-Xent formula:
+        given a fixed positive-pair similarity of 0.9 and orthogonal negatives,
+        a low temperature (τ=0.07) must produce a strictly lower loss than a
+        high temperature (τ=0.5).  This is deterministic and seed-independent.
+        """
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        B, D = 2, 128
+
+        # Controlled L2-normalised embeddings:
+        #   enhanced : e1 = [1, 0, 0, ...]
+        #   reference: r1 ≈ [0.9, 0.436, 0, ...]  (cosine sim with e1 ≈ 0.9)
+        #   raw      : x1 = [0, 0, 1, 0, ...]      (orthogonal to both)
+        emb_e = torch.zeros(B, D)
+        emb_e[:, 0] = 1.0
+        emb_r = torch.zeros(B, D)
+        emb_r[:, 0] = 0.9
+        emb_r[:, 1] = 0.436
+        emb_r = F.normalize(emb_r, dim=1)
+        emb_x = torch.zeros(B, D)
+        emb_x[:, 2] = 1.0
+
+        # Stateful projection stub: returns pre-set embeddings in call order
+        class _FixedProj(nn.Module):
+            def __init__(self, order):
+                super().__init__()
+                self._order = order  # list of tensors to return in sequence
+                self._idx = 0
+
+            def forward(self, _x):
+                out = self._order[self._idx % len(self._order)]
+                self._idx += 1
+                return out
+
         c1 = ContrastiveLoss(temperature=0.07)
         c2 = ContrastiveLoss(temperature=0.5)
-        l1 = c1(imgs["enhanced"], imgs["reference"], imgs["raw"]).item()
-        l2 = c2(imgs["enhanced"], imgs["reference"], imgs["raw"]).item()
+        for c in (c1, c2):
+            c.proj = _FixedProj([emb_e, emb_r, emb_x])
+
+        dummy = torch.zeros(B, 3, 8, 8)
+        l1 = c1(dummy, dummy, dummy).item()
+        l2 = c2(dummy, dummy, dummy).item()
+
+        assert l1 < l2, (
+            f"Low temperature should give lower loss than high temperature "
+            f"when positive sim > negative sim. Got τ=0.07→{l1:.4f}, τ=0.5→{l2:.4f}"
+        )
         assert (
-            abs(l1 - l2) > 1e-4
-        ), "Temperature change had no effect on contrastive loss"
+            abs(l1 - l2) > 0.1
+        ), f"Temperature effect too small: τ=0.07→{l1:.4f}, τ=0.5→{l2:.4f}"
 
 
 # ---------------------------------------------------------------------------
