@@ -337,12 +337,12 @@ class PhysicsDataModuleConfig:
     """Configuration for PhysicsUIEBDataModule."""
 
     # Dataset paths
-    raw_dir: str = "data/UIEB/raw"
-    ref_dir: str = "data/UIEB/reference"
+    raw_dir: str = "dataset/UIEB/raw"
+    ref_dir: str = "dataset/UIEB/reference"
 
     # Split manifest JSON produced by src.data.splitter
     # Must contain keys: train_indices, val_indices, test_indices, n_samples
-    split_manifest: str = "data/UIEB/split_manifest.json"
+    split_manifest: str = "dataset/UIEB/split_manifest.json"
 
     # DataLoader settings — tuned for RTX 4090 / Ryzen 9 7950X
     batch_size: int = 32
