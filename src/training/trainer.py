@@ -28,7 +28,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.tensorboard import SummaryWriter
 
-from src.data.datamodule import PhysicsUIEBDataModule
+from src.data.physics_dataset import PhysicsUIEBDataModule
 from src.losses.composite import CompositeLoss
 from src.models.p_uwdm import PUWDM, PUWDMConfig
 
