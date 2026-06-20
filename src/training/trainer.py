@@ -29,7 +29,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.tensorboard import SummaryWriter
 
 from src.data.physics_dataset import PhysicsUIEBDataModule, PhysicsDataModuleConfig
-from src.losses.composite import CompositeLoss
+from src.losses.composite import CompositeLoss, LossWeights
 from src.models.p_uwdm import PUWDM, PUWDMConfig
 
 log = logging.getLogger(__name__)
@@ -227,9 +227,15 @@ class PUWDMTrainer:
         log.info("Model params: %s M", f"{_count_params(self.model) / 1e6:.1f}")
 
     def _build_loss(self) -> None:
+        w = self.cfg.loss_weights
         self.criterion = CompositeLoss(
-            weights=self.cfg.loss_weights,
-            device=self.device,
+            weights=LossWeights(
+                diffusion=w["diffusion"],
+                adversarial=w["adversarial"],
+                perceptual=w["perceptual"],
+                histogram=w["histogram"],
+                contrastive=w["contrastive"],
+            )
         ).to(self.device)
 
     def _build_optimisers(self) -> None:
