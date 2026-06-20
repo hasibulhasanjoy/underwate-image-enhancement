@@ -43,7 +43,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class TrainerConfig:
     # ── paths ──────────────────────────────────────────────────────────────
-    data_root: str = "data/UIEB"  # root that contains raw/ & reference/
+    data_root: str = "dataset/UIEB"  # root that contains raw/ & reference/
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "runs/p_uwdm"
 

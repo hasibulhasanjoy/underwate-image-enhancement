@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     # paths
     p.add_argument(
         "--data_root",
-        default="data/UIEB",
+        default="dataset/UIEB",
         help="Root dir with raw/ and reference/ sub-folders",
     )
     p.add_argument("--checkpoint_dir", default="checkpoints")
