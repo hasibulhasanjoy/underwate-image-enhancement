@@ -28,7 +28,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.tensorboard import SummaryWriter
 
-from src.data.physics_dataset import PhysicsUIEBDataModule
+from src.data.physics_dataset import PhysicsUIEBDataModule, PhysicsDataModuleConfig
 from src.losses.composite import CompositeLoss
 from src.models.p_uwdm import PUWDM, PUWDMConfig
 
@@ -197,14 +197,17 @@ class PUWDMTrainer:
 
     def _build_data(self) -> None:
         cfg = self.cfg
-        self.dm = PhysicsUIEBDataModule(
-            data_root=cfg.data_root,
+        dm_cfg = PhysicsDataModuleConfig(
+            raw_dir=str(Path(cfg.data_root) / "raw"),
+            ref_dir=str(Path(cfg.data_root) / "reference"),
+            split_manifest=str(Path(cfg.data_root) / "split_manifest.json"),
             batch_size=cfg.batch_size,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
             prefetch_factor=cfg.prefetch_factor,
-            image_size=cfg.image_size,
+            load_size=(cfg.image_size, cfg.image_size),
         )
+        self.dm = PhysicsUIEBDataModule(dm_cfg)
         self.dm.setup()
         self.train_loader = self.dm.train_dataloader()
         self.val_loader = self.dm.val_dataloader()
