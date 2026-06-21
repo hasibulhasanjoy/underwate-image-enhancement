@@ -46,7 +46,7 @@ class DiffusionLoss(nn.Module):
         SNR(t) = ᾱ_t / (1 − ᾱ_t)
         weight  = min(SNR(t), γ) / SNR(t)
         """
-        acp = alphas_cumprod[timesteps]  # (B,)
+        acp = alphas_cumprod.to(timesteps.device)[timesteps]  # (B,)
         snr = acp / (1.0 - acp).clamp(min=1e-8)  # (B,)
         weights = torch.clamp(snr, max=gamma) / snr  # (B,)
         return weights  # (B,)
