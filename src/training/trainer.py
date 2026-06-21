@@ -125,11 +125,12 @@ def _save_checkpoint(
     scaler: GradScaler,
     best_val_loss: float,
 ) -> None:
+    ema_model = getattr(model, "_ema", None)
     torch.save(
         {
             "epoch": epoch,
             "model_state": model.state_dict(),
-            "ema_state": model.ema.shadow,
+            "ema_state": ema_model.shadow if ema_model is not None else None,
             "opt_g_state": opt_g.state_dict(),
             "opt_d_state": opt_d.state_dict(),
             "sched_g_state": sched_g.state_dict(),
@@ -241,33 +242,22 @@ class PUWDMTrainer:
     def _build_optimisers(self) -> None:
         cfg = self.cfg
 
-        # Generator: denoiser + conditioning networks
-        gen_params = [
-            p
-            for name, p in self.model.named_parameters()
-            if "discriminator" not in name and p.requires_grad
-        ]
+        # Generator: all PUWDM parameters
         self.opt_g = AdamW(
-            gen_params,
+            self.model.parameters(),
             lr=cfg.lr_generator,
             betas=cfg.betas,
             weight_decay=cfg.weight_decay,
         )
 
-        # Discriminator
-        disc_params = [
-            p for name, p in self.model.named_parameters() if "discriminator" in name
-        ]
+        # Discriminator: lives inside CompositeLoss's adversarial loss
         self.opt_d = AdamW(
-            disc_params,
+            self.criterion.discriminator.parameters(),
             lr=cfg.lr_discriminator,
             betas=cfg.betas,
             weight_decay=cfg.weight_decay,
         )
 
-        # Schedulers
-        #   Phase 1: linear warm-up over first 5 epochs
-        #   Phase 2: cosine annealing for remaining epochs
         warmup_steps = 5
         self.sched_g = SequentialLR(
             self.opt_g,
@@ -298,7 +288,8 @@ class PUWDMTrainer:
             "PHASE 1  (epochs 1–%d): generator-only training", self.cfg.phase1_epochs
         )
         log.info("═" * 60)
-        _freeze(self.model.discriminator)
+        self.criterion.set_phase(1)
+        _freeze(self.criterion.discriminator)
 
     def _enter_phase2(self) -> None:
         log.info("═" * 60)
@@ -308,7 +299,8 @@ class PUWDMTrainer:
             self.cfg.total_epochs,
         )
         log.info("═" * 60)
-        _unfreeze(self.model.discriminator)
+        self.criterion.set_phase(2)
+        _unfreeze(self.criterion.discriminator)
 
     # ------------------------------------------------------------------
     # Core train / val steps
@@ -327,6 +319,10 @@ class PUWDMTrainer:
 
         raw = batch["raw"].to(device, non_blocking=True)
         ref = batch["reference"].to(device, non_blocking=True)
+        ambient = batch["ambient"].to(device, non_blocking=True)
+        transmission = batch["transmission"].to(device, non_blocking=True)
+        degradation = batch["degradation"].to(device, non_blocking=True)
+        severity = batch["severity"].to(device, non_blocking=True)
 
         # ── sample random timestep ─────────────────────────────────────
         B = raw.size(0)
@@ -334,10 +330,27 @@ class PUWDMTrainer:
 
         # ── forward pass (bfloat16) ────────────────────────────────────
         with torch.autocast(device_type="cuda", dtype=dtype, enabled=self.cfg.use_amp):
-            step_out = self.model.training_step({"raw": raw, "reference": ref, "t": t})
+            step_out = self.model.training_step(
+                {
+                    "raw": raw,
+                    "reference": ref,
+                    "ambient": ambient,
+                    "transmission": transmission,
+                    "degradation": degradation,
+                    "severity": severity,
+                }
+            )
             # step_out keys: x_noisy, noise_pred, x0_pred, x_ref, x_raw, t
 
-            loss_dict = self.criterion(step_out, phase=phase)
+            loss_dict = self.criterion(
+                noise_pred=step_out["noise_pred"],
+                noise_target=step_out["noise_target"],
+                timesteps=step_out["timesteps"],
+                alphas_cumprod=step_out["alphas_cumprod"],
+                enhanced=step_out["enhanced"],
+                reference=ref,
+                raw=raw,
+            )
             g_loss = loss_dict["total"]
 
         # ── generator update ───────────────────────────────────────────
@@ -356,21 +369,26 @@ class PUWDMTrainer:
             with torch.autocast(
                 device_type="cuda", dtype=dtype, enabled=self.cfg.use_amp
             ):
-                d_loss = self.criterion.discriminator_loss(step_out)
+                d_loss = self.criterion.discriminator_loss(
+                    real=ref,
+                    fake=step_out["enhanced"],
+                    condition=raw,
+                )
             self.opt_d.zero_grad(set_to_none=True)
             self.scaler.scale(d_loss).backward()
             self.scaler.unscale_(self.opt_d)
             nn.utils.clip_grad_norm_(
-                self.model.discriminator.parameters(), self.cfg.grad_clip
+                self.criterion.discriminator.parameters(), self.cfg.grad_clip
             )
             self.scaler.step(self.opt_d)
             d_loss_val = d_loss.item()
 
         self.scaler.update()
+        self.global_step += 1
 
         # ── EMA update ─────────────────────────────────────────────────
         if self.global_step % self.cfg.ema_update_every == 0:
-            self.model.ema.update(self.model)
+            self.model.update_ema()
 
         return {
             k: v.item() if isinstance(v, torch.Tensor) else v
@@ -383,11 +401,32 @@ class PUWDMTrainer:
         device, dtype = self.device, self.dtype
         raw = batch["raw"].to(device, non_blocking=True)
         ref = batch["reference"].to(device, non_blocking=True)
+        ambient = batch["ambient"].to(device, non_blocking=True)
+        transmission = batch["transmission"].to(device, non_blocking=True)
+        degradation = batch["degradation"].to(device, non_blocking=True)
+        severity = batch["severity"].to(device, non_blocking=True)
         B = raw.size(0)
         t = torch.randint(0, self.cfg.num_train_timesteps, (B,), device=device)
         with torch.autocast(device_type="cuda", dtype=dtype, enabled=self.cfg.use_amp):
-            step_out = self.model.training_step({"raw": raw, "reference": ref, "t": t})
-            loss_dict = self.criterion(step_out, phase=1)  # no adversarial in val
+            step_out = self.model.training_step(
+                {
+                    "raw": raw,
+                    "reference": ref,
+                    "ambient": ambient,
+                    "transmission": transmission,
+                    "degradation": degradation,
+                    "severity": severity,
+                }
+            )
+            loss_dict = self.criterion(
+                noise_pred=step_out["noise_pred"],
+                noise_target=step_out["noise_target"],
+                timesteps=step_out["timesteps"],
+                alphas_cumprod=step_out["alphas_cumprod"],
+                enhanced=step_out["enhanced"],
+                reference=ref,
+                raw=raw,
+            )
         return loss_dict["total"].item()
 
     # ------------------------------------------------------------------
@@ -460,6 +499,9 @@ class PUWDMTrainer:
         self.sched_d.load_state_dict(ck["sched_d_state"])
         self.scaler.load_state_dict(ck["scaler_state"])
         self.best_val_loss = ck.get("best_val_loss", math.inf)
+        ema_state = ck.get("ema_state")
+        if ema_state is not None and getattr(self.model, "_ema", None) is not None:
+            self.model._ema.shadow = ema_state
         return ck["epoch"] + 1
 
     # ------------------------------------------------------------------
@@ -471,8 +513,11 @@ class PUWDMTrainer:
         start_epoch = self._try_resume(resume_from)
         log.info("Starting from epoch %d", start_epoch)
 
-        self._enter_phase1()
-        phase = 1
+        phase = 2 if start_epoch > cfg.phase1_epochs else 1
+        if phase == 1:
+            self._enter_phase1()
+        else:
+            self._enter_phase2()
 
         for epoch in range(start_epoch, cfg.total_epochs + 1):
 

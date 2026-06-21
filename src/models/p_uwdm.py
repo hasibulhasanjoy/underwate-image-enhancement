@@ -323,6 +323,7 @@ class PUWDM(nn.Module):
             transmission : (B, 1, H, W)
             degradation  : (B, 6)
             severity     : (B, 1)
+            t            : (B,), optional diffusion timesteps
 
         The ``raw`` and ``reference`` tensors are expected in the training
         normalisation range (e.g. ImageNet-normalised or [-1,1]).  Physics
@@ -351,8 +352,12 @@ class PUWDM(nn.Module):
         B = x0.shape[0]
         device = x0.device
 
-        # 1. Sample timesteps
-        t = self.scheduler.sample_timesteps(B, device=device)
+        # 1. Sample timesteps unless the caller supplies them explicitly.
+        t = batch.get("t")
+        if t is None:
+            t = self.scheduler.sample_timesteps(B, device=device)
+        else:
+            t = t.to(device)
 
         # 2. Add noise to clean reference
         x_t, eps = self.scheduler.add_noise(x0, t)
