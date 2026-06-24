@@ -283,8 +283,10 @@ def build_test_loader(
     from src.data.physics_dataset import PhysicsUIEBDataModule, PhysicsDataModuleConfig
 
     cfg = PhysicsDataModuleConfig(
-        data_root=data_root,
-        image_size=image_size,
+        raw_dir=str(Path(data_root) / "raw"),
+        ref_dir=str(Path(data_root) / "reference"),
+        split_manifest=str(Path(data_root) / "split_manifest.json"),
+        load_size=(image_size, image_size),
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=True,
