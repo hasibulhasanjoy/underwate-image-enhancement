@@ -131,3 +131,6 @@ htmlcov/
 .coverage
 coverage.xml
 train.pid
+
+results/
+results_epoch100/
