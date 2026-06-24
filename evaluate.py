@@ -214,6 +214,23 @@ def compute_uiqm(img_uint8: np.ndarray) -> float:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _strip_compiled_prefix(state_dict: dict) -> dict:
+    """
+    torch.compile() wraps the model and prepends '_orig_mod.' to every
+    parameter name in the state dict.  Strip it so the weights load cleanly
+    into a plain (uncompiled) PUWDM instance at eval time.
+    """
+    prefix = "_orig_mod."
+    if not any(k.startswith(prefix) for k in state_dict):
+        return state_dict  # already clean
+    stripped = {
+        (k[len(prefix) :] if k.startswith(prefix) else k): v
+        for k, v in state_dict.items()
+    }
+    log.info("Stripped '_orig_mod.' prefix from %d state-dict keys.", len(stripped))
+    return stripped
+
+
 def load_model(checkpoint_path: str, device: torch.device):
     """Load PUWDM from a training checkpoint and return it in eval mode."""
     from src.models.p_uwdm import PUWDM, PUWDMConfig
@@ -222,12 +239,24 @@ def load_model(checkpoint_path: str, device: torch.device):
     ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     model = PUWDM(PUWDMConfig())
-    model.load_state_dict(ck["model_state"])
+    model_state = _strip_compiled_prefix(ck["model_state"])
+    model.load_state_dict(model_state)
 
     # Apply EMA weights for inference if available
     ema_state = ck.get("ema_state")
     if ema_state is not None and model._ema is not None:
-        model._ema.shadow = ema_state
+        # EMA shadow keys may carry _orig_mod. prefix from torch.compile
+        # and may be scoped as 'denoiser.X' or '_orig_mod.denoiser.X'
+        def _fix_ema_keys(sd):
+            out = {}
+            for k, v in sd.items():
+                k = k.replace("_orig_mod.", "")
+                if k.startswith("denoiser."):
+                    k = k[len("denoiser.") :]
+                out[k] = v
+            return out
+
+        model._ema.shadow = _fix_ema_keys(ema_state)
         model._ema.copy_to(model.denoiser)
         log.info("EMA weights applied to denoiser.")
     else:
