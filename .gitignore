@@ -130,3 +130,4 @@ config/local.yaml
 htmlcov/
 .coverage
 coverage.xml
+train.pid
