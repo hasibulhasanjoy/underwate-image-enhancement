@@ -121,7 +121,7 @@ def _save_checkpoint(
     opt_d: AdamW,
     sched_g,
     sched_d,
-    scaler: GradScaler,
+    scaler: torch.amp.GradScaler,
     best_val_loss: float,
 ) -> None:
     ema_model = getattr(model, "_ema", None)
