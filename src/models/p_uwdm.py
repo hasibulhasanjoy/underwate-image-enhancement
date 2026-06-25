@@ -293,9 +293,13 @@ class PUWDM(nn.Module):
         cond_out: Dict[str, Tensor],
         degradation: Tensor,
         severity: Tensor,
+        raw: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Run the SwinUNet denoiser with the conditioning tensors.
+
+        raw is concatenated with x_t at the pixel level inside the denoiser
+        so it has direct spatial access to the degraded input image.
 
         Returns ε_pred : (B, C, H, W).
         """
@@ -306,6 +310,7 @@ class PUWDM(nn.Module):
             t_embedding=cond_out["t_embedding"],
             degradation=degradation,
             severity=severity,
+            raw=raw,
         )
 
     # ------------------------------------------------------------------
@@ -365,8 +370,8 @@ class PUWDM(nn.Module):
         # 3. Conditioning networks
         cond_out = self._encode_conditioning(raw, physics_A, physics_t)
 
-        # 4. Predict noise
-        eps_pred = self._predict_noise(x_t, t, cond_out, degradation, severity)
+        # 4. Predict noise (pass raw for pixel-level spatial conditioning)
+        eps_pred = self._predict_noise(x_t, t, cond_out, degradation, severity, raw=raw)
 
         # 5. Single-step denoised estimate (for perceptual/histogram/adv losses)
         #    x̂_0 = (x_t − √(1-ᾱ_t)·ε_pred) / √ᾱ_t
@@ -428,7 +433,9 @@ class PUWDM(nn.Module):
         a_emb = cond_out["a_embedding"]
         t_emb = cond_out["t_embedding"]
 
-        # Build a closure that the DDIM loop can call
+        # Build a closure that the DDIM loop can call.
+        # raw is passed so the denoiser can concatenate it with x_t at
+        # the pixel level — same as during training.
         def _model_fn(x_t: Tensor, t_step: Tensor) -> Tensor:
             return self.denoiser(
                 x_t=x_t,
@@ -437,17 +444,8 @@ class PUWDM(nn.Module):
                 t_embedding=t_emb,
                 degradation=degradation,
                 severity=severity,
+                raw=raw,
             )
-
-        # ── Correct DDIM starting point for image-to-image diffusion ──
-        # The model was trained to denoise x_t back to a clean reference,
-        # where x_t was created from the reference via add_noise(reference, t).
-        # At inference we don't have the reference, so we start the reverse
-        # chain from the degraded raw image corrupted to the highest timestep
-        # (t = T-1).  This gives the denoiser structural information to recover
-        # from, rather than starting from structureless Gaussian noise.
-        t_max = torch.full((B,), self.scheduler.T - 1, device=device, dtype=torch.long)
-        x_T, _ = self.scheduler.add_noise(raw, t_max)
 
         ctx = self.ema_context() if use_ema else _NullContext()
         with ctx:
@@ -457,7 +455,6 @@ class PUWDM(nn.Module):
                 device=device,
                 num_steps=num_steps,
                 eta=eta,
-                x_T=x_T,  # <-- conditioned starting point
                 progress=progress,
             )
 

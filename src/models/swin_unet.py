@@ -85,7 +85,8 @@ class SwinUNetConfig:
     """
 
     image_size: int = 256
-    in_channels: int = 3
+    in_channels: int = 3  # output channels (noise prediction)
+    in_channels_noisy: int = 6  # input channels: concat(raw, x_t) = 6
     embed_dim: int = 96
     depths: list[int] = field(default_factory=lambda: [2, 2, 6, 2, 2, 6, 2])
     num_heads: list[int] = field(default_factory=lambda: [3, 6, 12, 24, 12, 6, 3])
@@ -170,8 +171,9 @@ class SwinUNetDenoiser(nn.Module):
         # ------------------------------------------------------------------ #
         # Stem                                                                #
         # ------------------------------------------------------------------ #
+        # Input stem: cat(raw, x_t) = 6 channels.
         self.patch_embed = PatchEmbed(
-            in_channels=cfg.in_channels,
+            in_channels=cfg.in_channels_noisy,
             embed_dim=C,
             patch_size=cfg.patch_size,
         )
@@ -365,12 +367,13 @@ class SwinUNetDenoiser(nn.Module):
 
     def forward(
         self,
-        x_t: Tensor,  # (B, in_channels, H, W)  noisy image
+        x_t: Tensor,  # (B, 3, H, W)  noisy image at timestep t
         t: Tensor,  # (B,)  integer timestep
-        a_embedding: Tensor,  # (B, cond_embed_dim)  from A-Net   ← CHANGED
-        t_embedding: Tensor,  # (B, cond_embed_dim)  from T-Net   ← CHANGED
-        degradation: Tensor,  # (B, 6)                            unchanged
-        severity: Tensor,  # (B, 1)                            unchanged
+        a_embedding: Tensor,  # (B, cond_embed_dim)  from A-Net
+        t_embedding: Tensor,  # (B, cond_embed_dim)  from T-Net
+        degradation: Tensor,  # (B, 6)
+        severity: Tensor,  # (B, 1)
+        raw: Tensor | None = None,  # (B, 3, H, W)  degraded input image
     ) -> Tensor:
         """Predict noise ε from noisy image x_t.
 
@@ -380,8 +383,12 @@ class SwinUNetDenoiser(nn.Module):
         t           : (B,) integer diffusion timestep
         a_embedding : (B, 128) ambient-light embedding from A-Net
         t_embedding : (B, 128) transmission embedding from T-Net
-        degradation : (B, 6)   degradation feature vector (unchanged)
-        severity    : (B, 1)   degradation severity scalar (unchanged)
+        degradation : (B, 6)   degradation feature vector
+        severity    : (B, 1)   degradation severity scalar
+        raw         : (B, 3, H, W) raw degraded image — concatenated with x_t
+                      as pixel-level conditioning so the denoiser has direct
+                      spatial access to the input.  If None, falls back to
+                      zeros (for backward compatibility only).
 
         Returns
         -------
@@ -389,13 +396,18 @@ class SwinUNetDenoiser(nn.Module):
         """
         B, _, H_in, W_in = x_t.shape
 
+        # ── Pixel-level conditioning: cat(raw, x_t) → 6-channel stem input ─ #
+        if raw is None:
+            raw = torch.zeros_like(x_t)
+        x_in = torch.cat([raw, x_t], dim=1)  # (B, 6, H, W)
+
         # ── Conditioning ─────────────────────────────────────────────────── #
         cond = self._encode_conditioning(
             t, a_embedding, t_embedding, degradation, severity
         )
 
         # ── Stem ─────────────────────────────────────────────────────────── #
-        x, H, W = self.patch_embed(x_t)
+        x, H, W = self.patch_embed(x_in)
 
         # ── Encoder ──────────────────────────────────────────────────────── #
         x = self.enc_stage0(x, cond, H, W)

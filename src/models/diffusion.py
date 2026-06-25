@@ -218,9 +218,7 @@ class DDIMScheduler:
         recip_m1 = self._get("sqrt_recipm1_alphas_cumprod", t, device)
         x0_pred = recip * x_t - recip_m1 * eps
         if self.clip_denoised:
-            # Training images are in [0, 1] (DataModule used no transform,
-            # so no ImageNet normalisation was applied).
-            x0_pred = x0_pred.clamp(0.0, 1.0)
+            x0_pred = x0_pred.clamp(0.0, 1.0)  # training images are in [0,1]
         return x0_pred
 
     # ------------------------------------------------------------------
