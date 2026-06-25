@@ -218,7 +218,11 @@ class DDIMScheduler:
         recip_m1 = self._get("sqrt_recipm1_alphas_cumprod", t, device)
         x0_pred = recip * x_t - recip_m1 * eps
         if self.clip_denoised:
-            x0_pred = x0_pred.clamp(-1.0, 1.0)
+            # Images are ImageNet-normalised: values live in roughly [-2, 2].
+            # Clipping to [-1, 1] destroys valid signal.  Use a loose bound
+            # of [-3, 3] which catches genuinely divergent predictions without
+            # truncating normal content.
+            x0_pred = x0_pred.clamp(-3.0, 3.0)
         return x0_pred
 
     # ------------------------------------------------------------------

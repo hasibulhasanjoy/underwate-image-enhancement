@@ -439,6 +439,16 @@ class PUWDM(nn.Module):
                 severity=severity,
             )
 
+        # ── Correct DDIM starting point for image-to-image diffusion ──
+        # The model was trained to denoise x_t back to a clean reference,
+        # where x_t was created from the reference via add_noise(reference, t).
+        # At inference we don't have the reference, so we start the reverse
+        # chain from the degraded raw image corrupted to the highest timestep
+        # (t = T-1).  This gives the denoiser structural information to recover
+        # from, rather than starting from structureless Gaussian noise.
+        t_max = torch.full((B,), self.scheduler.T - 1, device=device, dtype=torch.long)
+        x_T, _ = self.scheduler.add_noise(raw, t_max)
+
         ctx = self.ema_context() if use_ema else _NullContext()
         with ctx:
             enhanced = self.scheduler.ddim_sample_loop(
@@ -447,6 +457,7 @@ class PUWDM(nn.Module):
                 device=device,
                 num_steps=num_steps,
                 eta=eta,
+                x_T=x_T,  # <-- conditioned starting point
                 progress=progress,
             )
 

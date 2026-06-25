@@ -245,15 +245,21 @@ def load_model(checkpoint_path: str, device: torch.device):
     # Apply EMA weights for inference if available
     ema_state = ck.get("ema_state")
     if ema_state is not None and model._ema is not None:
-        # EMA shadow keys may carry _orig_mod. prefix from torch.compile
-        # and may be scoped as 'denoiser.X' or '_orig_mod.denoiser.X'
+        # EMA shadow keys are stored as the denoiser's own parameter names
+        # (e.g. "patch_embed.proj.weight"), NOT as "denoiser.patch_embed...".
+        # The trainer may have saved them with a "_orig_mod." prefix from
+        # torch.compile — strip that, but do NOT strip "denoiser." because
+        # it was never part of the shadow key names.
         def _fix_ema_keys(sd):
             out = {}
             for k, v in sd.items():
                 k = k.replace("_orig_mod.", "")
-                if k.startswith("denoiser."):
-                    k = k[len("denoiser.") :]
+                # Only strip "denoiser." if all keys carry it
+                # (older checkpoint format); detect by checking the majority.
                 out[k] = v
+            # If keys look like "denoiser.patch_embed.*", strip the prefix
+            if all(k.startswith("denoiser.") for k in out):
+                out = {k[len("denoiser.") :]: v for k, v in out.items()}
             return out
 
         model._ema.shadow = _fix_ema_keys(ema_state)
