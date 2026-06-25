@@ -23,7 +23,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.tensorboard import SummaryWriter
@@ -188,7 +187,7 @@ class PUWDMTrainer:
         self._build_loss()
         self._build_optimisers()
 
-        self.scaler = GradScaler(enabled=cfg.use_amp)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=cfg.use_amp)
         self.global_step = 0
         self.best_val_loss = math.inf
 
@@ -481,18 +480,13 @@ class PUWDMTrainer:
     # ------------------------------------------------------------------
 
     def _try_resume(self, ckpt_path: Optional[str]) -> int:
-        """Returns start_epoch (1-based)."""
+        """Returns start_epoch (1-based).  Pass None to start fresh."""
         if ckpt_path is None:
-            # auto-find latest
-            ckpts = sorted(self.ckpt_dir.glob("epoch_*.pt"), key=os.path.getmtime)
-            if not ckpts:
-                return 1
-            ckpt_path = str(ckpts[-1])
+            return 1  # fresh training run — do NOT auto-detect old checkpoints
 
         log.info("Resuming from %s", ckpt_path)
-        ck = torch.load(ckpt_path, map_location=self.device)
+        ck = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ck["model_state"])
-        self.model.ema.shadow = ck["ema_state"]
         self.opt_g.load_state_dict(ck["opt_g_state"])
         self.opt_d.load_state_dict(ck["opt_d_state"])
         self.sched_g.load_state_dict(ck["sched_g_state"])
