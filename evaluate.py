@@ -248,17 +248,15 @@ def load_model(checkpoint_path: str, device: torch.device):
         # EMA shadow keys are stored as the denoiser's own parameter names
         # (e.g. "patch_embed.proj.weight"), NOT as "denoiser.patch_embed...".
         # The trainer may have saved them with a "_orig_mod." prefix from
-        # torch.compile — strip that, but do NOT strip "denoiser." because
-        # it was never part of the shadow key names.
+        # torch.compile — strip that, but do NOT strip "denoiser." unless
+        # all keys actually carry it (detect by inspection).
         def _fix_ema_keys(sd):
             out = {}
             for k, v in sd.items():
                 k = k.replace("_orig_mod.", "")
-                # Only strip "denoiser." if all keys carry it
-                # (older checkpoint format); detect by checking the majority.
                 out[k] = v
             # If keys look like "denoiser.patch_embed.*", strip the prefix
-            if all(k.startswith("denoiser.") for k in out):
+            if out and all(k.startswith("denoiser.") for k in out):
                 out = {k[len("denoiser.") :]: v for k, v in out.items()}
             return out
 
@@ -338,12 +336,12 @@ def evaluate_batch(
             eta=0.0,
             use_ema=True,
             progress=False,
-        )  # (B, 3, H, W) in ImageNet-normalised space
+        )  # (B, 3, H, W) in [0, 1] — model was trained WITHOUT ImageNet normalisation
 
-    # Denormalise all tensors to [0, 1] for metric computation
-    enhanced_01 = denorm(enhanced_norm)  # (B, 3, H, W)
-    raw_01 = denorm(raw)
-    ref_01 = denorm(reference)
+    # Images are already in [0, 1] — no denorm needed
+    enhanced_01 = enhanced_norm.clamp(0.0, 1.0)
+    raw_01 = raw.clamp(0.0, 1.0)
+    ref_01 = reference.clamp(0.0, 1.0)
 
     B = raw_01.shape[0]
     results = []
