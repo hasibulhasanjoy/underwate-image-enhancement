@@ -11,8 +11,7 @@ Responsibilities
    Returns the noisy image and the noise sample used to produce it.
 3. **DDIM reverse / sampling** — deterministic (η=0) or stochastic (η>0)
    reverse step following Song et al. 2020 (DDIM).  50-step accelerated
-   sampling uses a uniformly spaced subsequence of the full 1000-step
-   schedule.
+   sampling uses a subsequence capped at T_max where ᾱ_t >= 0.01.
 4. **Utility** — SNR / ᾱ look-up helpers used by DiffusionLoss.
 
 API summary
@@ -25,11 +24,10 @@ API summary
 
     # Inference: 50-step DDIM loop
     x     = sched.ddim_sample_loop(
-                model_fn,                     # callable: (x_t, t, **cond) → ε_pred
+                model_fn,                     # callable: (x_t, t) → ε_pred
                 shape=(B, 3, H, W),
                 device=device,
                 num_steps=50,
-                **cond_kwargs,
             )
 
 Design notes
@@ -41,6 +39,8 @@ Design notes
   schedule tables.
 - `ddim_sample_loop` accepts an arbitrary `model_fn` so it can be used with
   the full P-UWDM forward pass or with classifier-free guidance in future.
+- T_max is capped at the last t where ᾱ_t >= 0.01 to avoid the near-zero
+  signal region (t > 934 with cosine schedule) which produces pure noise.
 """
 
 from __future__ import annotations
@@ -89,9 +89,8 @@ class DDIMScheduler:
     s : float
         Cosine schedule offset (default 0.008, per Nichol & Dhariwal).
     clip_denoised : bool
-        If True, clamp the predicted x_0 estimate to [-1, 1] during
-        DDIM reverse steps.  Recommended when images are in [-1, 1].
-        Set False when using [0, 1] range.
+        If True, clamp the predicted x_0 estimate to [0, 1] during
+        DDIM reverse steps.  Training images are in [0, 1] (no ImageNet norm).
     """
 
     def __init__(
@@ -107,7 +106,7 @@ class DDIMScheduler:
         betas = _cosine_betas(T, s)  # (T,)
         alphas = 1.0 - betas  # (T,)
         alphas_cumprod = torch.cumprod(alphas, dim=0)  # ᾱ_t  (T,)
-        alphas_cumprod_prev = F.pad(  # ᾱ_{t-1} (T,)  [1, ᾱ_0, ..., ᾱ_{T-1}]
+        alphas_cumprod_prev = F.pad(  # ᾱ_{t-1} (T,)
             alphas_cumprod[:-1], (1, 0), value=1.0
         )
 
@@ -131,7 +130,6 @@ class DDIMScheduler:
             betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
         )
         self.register("posterior_variance", posterior_variance)
-        # Log clipped for numerical stability
         self.register(
             "posterior_log_variance_clipped",
             torch.log(posterior_variance.clamp(min=1e-20)),
@@ -145,7 +143,12 @@ class DDIMScheduler:
             (1.0 - alphas_cumprod_prev) * alphas.sqrt() / (1.0 - alphas_cumprod),
         )
 
-        # ── Cache dict for device migration ───────────────────────────
+        # Pre-compute T_max: last timestep where ᾱ_t >= 0.01
+        # (cosine schedule collapses to ~2e-9 at t=999; sampling above T_max
+        #  means starting from near-pure noise with no recoverable signal)
+        valid = (alphas_cumprod >= 0.01).nonzero(as_tuple=True)[0]
+        self._T_max = int(valid.max().item()) if len(valid) > 0 else T - 1
+
         self._device_cache: Dict[str, Tensor] = {}
 
     # ------------------------------------------------------------------
@@ -154,10 +157,6 @@ class DDIMScheduler:
 
     def register(self, name: str, tensor: Tensor) -> None:
         setattr(self, name, tensor)
-
-    def _to(self, tensor: Tensor, device: torch.device) -> Tensor:
-        """Move tensor to device, caching to avoid repeated transfers."""
-        return tensor.to(device)
 
     def _get(self, name: str, t: Tensor, device: torch.device) -> Tensor:
         """
@@ -192,17 +191,17 @@ class DDIMScheduler:
 
         Parameters
         ----------
-        x0 : Tensor  (B, C, H, W)  clean image
+        x0 : Tensor  (B, C, H, W)  clean image in [0, 1]
         t  : Tensor  (B,)           integer timesteps
 
         Returns
         -------
         x_t : Tensor  (B, C, H, W)  noisy image
-        eps : Tensor  (B, C, H, W)  the noise actually added  (= training target)
+        eps : Tensor  (B, C, H, W)  the noise actually added (= training target)
         """
         device = x0.device
         eps = torch.randn_like(x0)
-        sqrt_acp = self._get("sqrt_alphas_cumprod", t, device)  # (B,1,1,1)
+        sqrt_acp = self._get("sqrt_alphas_cumprod", t, device)
         sqrt_1m = self._get("sqrt_one_minus_alphas_cumprod", t, device)
         x_t = sqrt_acp * x0 + sqrt_1m * eps
         return x_t, eps
@@ -218,7 +217,8 @@ class DDIMScheduler:
         recip_m1 = self._get("sqrt_recipm1_alphas_cumprod", t, device)
         x0_pred = recip * x_t - recip_m1 * eps
         if self.clip_denoised:
-            x0_pred = x0_pred.clamp(0.0, 1.0)  # training images are in [0,1]
+            # Training images are in [0, 1] — clamp to keep reverse chain stable.
+            x0_pred = x0_pred.clamp(0.0, 1.0)
         return x0_pred
 
     # ------------------------------------------------------------------
@@ -248,8 +248,7 @@ class DDIMScheduler:
         t        : (B,)  current timestep
         t_prev   : (B,)  previous (lower) timestep in the subsequence
         eps_pred : (B, C, H, W)  noise prediction from the denoiser
-        eta      : float  stochasticity.  0 = deterministic DDIM,
-                          1 = equivalent to DDPM.
+        eta      : float  stochasticity (0 = deterministic DDIM)
 
         Returns
         -------
@@ -261,27 +260,24 @@ class DDIMScheduler:
         acp_prev = self._get("alphas_cumprod", t_prev, device)  # (B,1,1,1)
 
         # Predict x_0
-        x0_pred = self.predict_x0_from_eps(x_t, t, eps_pred)  # (B,C,H,W)
+        x0_pred = self.predict_x0_from_eps(x_t, t, eps_pred)
 
-        # Direction pointing to x_t
+        # DDIM direction coefficients
         sqrt_1m_acp_prev = (1.0 - acp_prev).sqrt()
         sqrt_1m_acp = (1.0 - acp).sqrt()
 
-        # σ_t = η · sqrt((1-ᾱ_{t-1})/(1-ᾱ_t)) · sqrt(1 - ᾱ_t/ᾱ_{t-1})
         sigma = (
             eta
             * (sqrt_1m_acp_prev / sqrt_1m_acp)
             * ((1.0 - acp / acp_prev).clamp(min=0.0)).sqrt()
         )
 
-        # Direction coefficient
         dir_coef = (1.0 - acp_prev - sigma**2).clamp(min=0.0).sqrt()
 
         x_prev = acp_prev.sqrt() * x0_pred + dir_coef * eps_pred
 
         if eta > 0.0:
-            noise = torch.randn_like(x_t)
-            x_prev = x_prev + sigma * noise
+            x_prev = x_prev + sigma * torch.randn_like(x_t)
 
         return x_prev
 
@@ -302,57 +298,47 @@ class DDIMScheduler:
         **model_kwargs,
     ) -> Tensor:
         """
-        DDIM accelerated sampling (50-step by default).
+        DDIM accelerated sampling.
+
+        Key fix: timestep subsequence is capped at self._T_max (the last t
+        where ᾱ_t >= 0.01).  The original loop started at t=980 where
+        ᾱ_980 = 0.00088 — essentially pure noise with no recoverable signal,
+        which is why all outputs were pure noise regardless of conditioning.
 
         Parameters
         ----------
-        model_fn : callable
-            Signature: (x_t, t, **model_kwargs) → eps_pred (B, C, H, W)
-            The caller is responsible for pre-computing conditioning tensors
-            (a_embedding, t_embedding, degradation, severity) and passing
-            them in model_kwargs.
-        shape : tuple
-            Output tensor shape (B, C, H, W).
-        device : torch.device
-        num_steps : int
-            Number of DDIM steps (default 50; much faster than 1000).
-        eta : float
-            DDIM stochasticity parameter (0 = deterministic).
-        x_T : Tensor, optional
-            Starting noise.  If None, sampled from N(0, I).
-        progress : bool
-            Print a simple step counter (no tqdm dependency).
-        **model_kwargs :
-            Passed verbatim to model_fn at every step.
+        model_fn  : callable  (x_t, t_tensor) → eps_pred (B, C, H, W)
+        shape     : (B, C, H, W)
+        device    : torch.device
+        num_steps : int    DDIM steps (default 50)
+        eta       : float  stochasticity (0 = deterministic)
+        x_T       : Tensor or None  starting noise; sampled if None
+        progress  : bool   print step counter
 
         Returns
         -------
-        Tensor  (B, C, H, W)  denoised sample in the same range as the
-                              training targets (typically [-1,1] or [0,1]).
+        Tensor  (B, C, H, W)  enhanced image in [0, 1]
         """
         device = torch.device(device) if isinstance(device, str) else device
 
-        # Build uniformly-spaced timestep subsequence
-        step_ratio = self.T // num_steps
-        timesteps = (
-            (torch.arange(0, num_steps) * step_ratio).long().flip(0)
-        )  # descending: [T-1, ..., 0]
+        # ── Timestep subsequence ──────────────────────────────────────────
+        # Cap at T_max where ᾱ_t >= 0.01 to stay in the recoverable region.
+        # With cosine schedule T=1000: T_max ~ 934, ᾱ_934 ~ 0.010.
+        T_max = self._T_max
+        timesteps = torch.linspace(T_max, 0, num_steps + 1).long()
+        t_seq = timesteps[:-1]  # [T_max, ..., small_t]  length=num_steps
+        t_prev_seq = timesteps[1:]  # [t-1,   ..., 0]        length=num_steps
 
-        # Starting noise
+        # ── Starting noise ────────────────────────────────────────────────
         x = x_T if x_T is not None else torch.randn(shape, device=device)
 
-        for i, t_val in enumerate(timesteps):
+        # ── Reverse loop ──────────────────────────────────────────────────
+        for i, (t_val, t_prev_val) in enumerate(zip(t_seq, t_prev_seq)):
             t_tensor = torch.full(
                 (shape[0],), t_val.item(), device=device, dtype=torch.long
             )
-
-            # t_prev: next lower timestep (or 0 at the last step)
-            if i + 1 < len(timesteps):
-                t_prev_val = timesteps[i + 1].item()
-            else:
-                t_prev_val = 0
             t_prev_tensor = torch.full(
-                (shape[0],), t_prev_val, device=device, dtype=torch.long
+                (shape[0],), t_prev_val.item(), device=device, dtype=torch.long
             )
 
             eps_pred = model_fn(x, t_tensor, **model_kwargs)
@@ -360,7 +346,8 @@ class DDIMScheduler:
 
             if progress:
                 print(
-                    f"\r  DDIM step {i+1}/{num_steps} (t={t_val.item()})",
+                    f"\r  DDIM step {i + 1}/{num_steps} "
+                    f"(t={t_val.item()} → {t_prev_val.item()})",
                     end="",
                     flush=True,
                 )
@@ -379,14 +366,6 @@ class DDIMScheduler:
         Signal-to-noise ratio at timestep t.
 
         SNR(t) = ᾱ_t / (1 - ᾱ_t)
-
-        Parameters
-        ----------
-        t : Tensor (B,) long
-
-        Returns
-        -------
-        Tensor (B,) float
         """
         device = t.device
         acp = self.alphas_cumprod.to(device)[t]
@@ -400,7 +379,7 @@ class DDIMScheduler:
     def __repr__(self) -> str:
         acp = self.alphas_cumprod
         return (
-            f"DDIMScheduler(T={self.T}, "
+            f"DDIMScheduler(T={self.T}, T_max={self._T_max}, "
             f"ᾱ_min={acp.min():.4f}, ᾱ_max={acp.max():.4f}, "
             f"clip_denoised={self.clip_denoised})"
         )
