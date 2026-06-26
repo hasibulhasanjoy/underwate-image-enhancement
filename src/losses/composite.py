@@ -1,26 +1,36 @@
 """
-Composite Loss
-==============
-Orchestrates all five P-UWDM loss components with phase-aware weighting.
+src/losses/composite.py
+────────────────────────────────────────────────────────────────────────────
+Composite Loss — fixed version.
 
-Two training phases (aligned with the two-phase training schedule):
+Root cause of original failure
+───────────────────────────────
+The original composite loss applied perceptual, histogram, adversarial, and
+contrastive losses against `enhanced`, which is predict_x0_from_eps() at a
+random training timestep t ~ Uniform(0,1000).  At high t (e.g. t=800),
+x0_pred is dominated by noise, so these losses compared garbage vs reference
+and produced massive gradients that overwhelmed the diffusion loss.  The
+denoiser learned to minimise those gradients by outputting eps_pred ≈ 0
+(noise collapse), which is why inference produced pure noise.
 
-  Phase 1 (warm-up, epochs 1–30):
-    Focus on diffusion + perceptual + histogram.
-    Adversarial and contrastive are disabled (weight = 0) to stabilise
-    early training before the discriminator is meaningful.
+Fix
+───
+Two-phase training:
 
-  Phase 2 (full training, epochs 31–100):
-    All five components active.
+  Phase 1 (epochs 1–80): diffusion loss ONLY.
+    The denoiser must learn to predict noise correctly before any image-level
+    losses are applied.  eps_pred std should converge to ~1.0 by epoch 40-50.
 
-Default weights (tunable via LossWeights):
-    λ_diff   = 1.0
-    λ_adv    = 0.01   (low — adversarial destabilises if too large)
-    λ_perc   = 0.1
-    λ_hist   = 0.05
-    λ_con    = 0.05
+  Phase 2 (epochs 81–100): diffusion + perceptual (low weight).
+    Perceptual loss is only applied when the timestep is "low" (t < 200),
+    i.e. when x0_pred is a meaningful near-clean estimate.  Adversarial,
+    histogram, and contrastive are disabled — they provide marginal benefit
+    for a dataset of ~890 images and can destabilise training.
 
-Total:  L = λ_diff·L_diff + λ_adv·L_adv + λ_perc·L_perc + λ_hist·L_hist + λ_con·L_con
+Loss weights
+────────────
+  Phase 1:  λ_diff=1.0,  all others=0.0
+  Phase 2:  λ_diff=1.0,  λ_perc=0.05,  all others=0.0
 """
 
 from __future__ import annotations
@@ -39,58 +49,48 @@ from .contrastive import ContrastiveLoss
 
 @dataclass
 class LossWeights:
-    """
-    Scalar multipliers for each loss component.
-
-    Set a weight to 0.0 to disable that component entirely (no forward pass).
-    """
-
     diffusion: float = 1.0
-    adversarial: float = 0.01
-    perceptual: float = 0.1
-    histogram: float = 0.05
-    contrastive: float = 0.05
+    adversarial: float = 0.0
+    perceptual: float = 0.0
+    histogram: float = 0.0
+    contrastive: float = 0.0
 
     @classmethod
     def phase1(cls) -> "LossWeights":
-        """Phase-1 preset: diffusion + perceptual + histogram only."""
+        """Phase 1: diffusion loss only — let the denoiser learn noise prediction."""
         return cls(
             diffusion=1.0,
             adversarial=0.0,
-            perceptual=0.1,
-            histogram=0.05,
+            perceptual=0.0,
+            histogram=0.0,
             contrastive=0.0,
         )
 
     @classmethod
     def phase2(cls) -> "LossWeights":
-        """Phase-2 preset: all five components active."""
+        """Phase 2: add light perceptual loss at low timesteps only."""
         return cls(
             diffusion=1.0,
-            adversarial=0.01,
-            perceptual=0.1,
-            histogram=0.05,
-            contrastive=0.05,
+            adversarial=0.0,
+            perceptual=0.05,
+            histogram=0.0,
+            contrastive=0.0,
         )
+
+
+# Timestep threshold below which x0_pred is meaningful for image-level losses.
+# At t < LOW_T_THRESHOLD, ᾱ_t > 0.36, so x0_pred has reasonable signal.
+LOW_T_THRESHOLD = 200
 
 
 class CompositeLoss(nn.Module):
     """
-    Five-component composite loss for P-UWDM.
-
-    PerceptualLoss (VGG-16) is lazy-initialised on first use so that
-    importing this class does not trigger a network download.  On your
-    server the weights are already cached in ~/.cache/torch after the
-    first run.
+    Composite loss for P-UWDM — fixed two-phase version.
 
     Args:
-        weights:          LossWeights instance; defaults to phase-2 weights.
-        snr_gamma:        Min-SNR-γ clipping for diffusion loss (None = uniform).
-        disc_base_ch:     Base channels for PatchDiscriminator (default 64).
-        perc_layer_w:     Per-layer weights for VGG perceptual loss.
-        hist_n_bins:      Histogram bins (default 256).
-        hist_bandwidth:   Histogram soft-binning bandwidth (default 0.02).
-        cont_temperature: NT-Xent temperature (default 0.07).
+        weights:     LossWeights instance (default: phase1).
+        snr_gamma:   Min-SNR-γ for diffusion loss (default 5.0).
+        disc_base_ch: PatchDiscriminator base channels (kept for API compat).
     """
 
     def __init__(
@@ -105,11 +105,13 @@ class CompositeLoss(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.weights = weights or LossWeights.phase2()
+        self.weights = weights or LossWeights.phase1()
         self._perc_layer_w = perc_layer_w
 
-        # Core sub-modules (always instantiated — no network access needed)
+        # Always-present sub-modules
         self.diffusion_loss = DiffusionLoss(snr_gamma=snr_gamma)
+
+        # Kept for API compatibility but not used in phase1/phase2 presets
         self.adversarial_loss = AdversarialLoss()
         self.discriminator = PatchDiscriminator(base_channels=disc_base_ch)
         self.histogram_loss = HistogramLoss(
@@ -117,40 +119,21 @@ class CompositeLoss(nn.Module):
         )
         self.contrastive_loss = ContrastiveLoss(temperature=cont_temperature)
 
-        # PerceptualLoss is lazy-initialised on first use (triggers VGG-16 download
-        # on first call if weights not already cached in ~/.cache/torch/).
+        # Lazy-init perceptual loss (triggers VGG download on first use)
         self._perceptual_loss: PerceptualLoss | None = None
-
-    # ------------------------------------------------------------------
-    # Lazy perceptual loss property
-    # ------------------------------------------------------------------
 
     @property
     def perceptual_loss(self) -> PerceptualLoss:
-        """Initialise VGG-16 perceptual loss on first access."""
         if self._perceptual_loss is None:
             self._perceptual_loss = PerceptualLoss(layer_weights=self._perc_layer_w)
-            # Move to same device as discriminator
             device = next(self.discriminator.parameters()).device
             self._perceptual_loss = self._perceptual_loss.to(device)
         return self._perceptual_loss
 
-    # ------------------------------------------------------------------
-    # Weight / phase management
-    # ------------------------------------------------------------------
-
     def set_weights(self, weights: LossWeights) -> None:
-        """Replace loss weights (e.g. when transitioning between phases)."""
         self.weights = weights
 
     def set_phase(self, phase: int) -> None:
-        """
-        Convenience method: set weights for phase 1 or 2.
-
-        Args:
-            phase: 1 → phase-1 preset (no adversarial/contrastive),
-                   2 → phase-2 preset (all five components).
-        """
         if phase == 1:
             self.weights = LossWeights.phase1()
         elif phase == 2:
@@ -158,19 +141,13 @@ class CompositeLoss(nn.Module):
         else:
             raise ValueError(f"Unknown phase {phase}. Expected 1 or 2.")
 
-    # ------------------------------------------------------------------
-    # Generator / denoiser loss
-    # ------------------------------------------------------------------
-
     def forward(
         self,
         *,
-        # Diffusion inputs
         noise_pred: torch.Tensor,
         noise_target: torch.Tensor,
         timesteps: torch.Tensor,
         alphas_cumprod: torch.Tensor | None = None,
-        # Image inputs (denoised/enhanced vs references) — all in [0, 1]
         enhanced: torch.Tensor | None = None,
         reference: torch.Tensor | None = None,
         raw: torch.Tensor | None = None,
@@ -178,18 +155,9 @@ class CompositeLoss(nn.Module):
         """
         Compute composite generator loss.
 
-        All image tensors must be in [0, 1].
-
-        Required always:
-            noise_pred, noise_target, timesteps
-
-        Required for perceptual / histogram / adversarial / contrastive:
-            enhanced, reference, raw
-
-        Returns:
-            dict with keys:
-                'total', 'diffusion', 'adversarial',
-                'perceptual', 'histogram', 'contrastive'
+        Image-level losses (perceptual etc.) are only applied to samples
+        where timestep t < LOW_T_THRESHOLD (200), ensuring x0_pred is a
+        meaningful near-clean estimate rather than dominated by noise.
         """
         w = self.weights
         device = noise_pred.device
@@ -197,57 +165,42 @@ class CompositeLoss(nn.Module):
 
         losses: dict[str, torch.Tensor] = {}
 
-        # 1. Diffusion loss (always active)
+        # 1. Diffusion loss — always active, all timesteps
         losses["diffusion"] = self.diffusion_loss(
             noise_pred, noise_target, timesteps, alphas_cumprod
         )
 
-        # 2. Adversarial (generator side)
-        if w.adversarial > 0.0 and enhanced is not None and raw is not None:
-            losses["adversarial"] = self.adversarial_loss(
-                self.discriminator, enhanced, raw
-            )
-        else:
-            losses["adversarial"] = zero
+        # 2–5. Image-level losses — only where x0_pred is meaningful
+        # Find batch indices where t < LOW_T_THRESHOLD
+        low_t_mask = timesteps < LOW_T_THRESHOLD  # (B,)
+        has_low_t = low_t_mask.any()
 
-        # 3. Perceptual (lazy VGG init on first call)
-        if w.perceptual > 0.0 and enhanced is not None and reference is not None:
-            losses["perceptual"] = self.perceptual_loss(enhanced, reference)
+        # Adversarial (disabled in both phases — kept for API compat)
+        losses["adversarial"] = zero
+
+        # Perceptual
+        if (
+            w.perceptual > 0.0
+            and has_low_t
+            and enhanced is not None
+            and reference is not None
+        ):
+            enh_low = enhanced[low_t_mask]
+            ref_low = reference[low_t_mask]
+            losses["perceptual"] = self.perceptual_loss(enh_low, ref_low)
         else:
             losses["perceptual"] = zero
 
-        # 4. Histogram
-        if w.histogram > 0.0 and enhanced is not None and reference is not None:
-            losses["histogram"] = self.histogram_loss(enhanced, reference)
-        else:
-            losses["histogram"] = zero
+        # Histogram (disabled — kept for API compat)
+        losses["histogram"] = zero
 
-        # 5. Contrastive
-        if (
-            w.contrastive > 0.0
-            and enhanced is not None
-            and reference is not None
-            and raw is not None
-        ):
-            losses["contrastive"] = self.contrastive_loss(enhanced, reference, raw)
-        else:
-            losses["contrastive"] = zero
+        # Contrastive (disabled — kept for API compat)
+        losses["contrastive"] = zero
 
         # Weighted sum
-        total = (
-            w.diffusion * losses["diffusion"]
-            + w.adversarial * losses["adversarial"]
-            + w.perceptual * losses["perceptual"]
-            + w.histogram * losses["histogram"]
-            + w.contrastive * losses["contrastive"]
-        )
+        total = w.diffusion * losses["diffusion"] + w.perceptual * losses["perceptual"]
         losses["total"] = total
-
         return losses
-
-    # ------------------------------------------------------------------
-    # Discriminator loss (separate update step)
-    # ------------------------------------------------------------------
 
     def discriminator_loss(
         self,
@@ -255,17 +208,7 @@ class CompositeLoss(nn.Module):
         fake: torch.Tensor,
         condition: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute discriminator update loss.
-
-        Args:
-            real:      (B, 3, H, W)  reference (clean) images in [0, 1]
-            fake:      (B, 3, H, W)  enhanced images  — caller must .detach()
-            condition: (B, 3, H, W)  raw degraded images in [0, 1]
-
-        Returns:
-            Scalar discriminator loss.
-        """
+        """Kept for API compatibility — not used in fixed training."""
         return self.adversarial_loss.discriminator_loss(
             self.discriminator, real, fake, condition
         )

@@ -1,14 +1,22 @@
 """
-src/training/trainer.py
+src/training/trainer.py — fixed version.
 
-Two-phase training loop for P-UWDM.
+Key changes from original
+──────────────────────────
+1. Phase 1 (epochs 1–80): diffusion loss ONLY.  No perceptual, no adversarial.
+   The denoiser must converge on noise prediction before any image-level loss
+   is applied.  Original phase 1 was only 50 epochs and included perceptual +
+   histogram losses that caused noise prediction collapse (eps_pred std → 0.1).
 
-Phase 1 (epochs 1–50):   Train denoiser + conditioning networks only.
-                          Discriminator is frozen. No adversarial loss.
-Phase 2 (epochs 51–100): Unfreeze discriminator.  All five loss terms active.
-                          Lower LR via cosine annealing.
+2. Phase 2 (epochs 81–100): diffusion + light perceptual (weight 0.05).
+   No adversarial — it destabilises training at this dataset scale (890 images).
+   No discriminator update step.
 
-Hardware target: RTX 4090 (24 GB), bfloat16 AMP, torch.compile.
+3. Removed the loss_weights override in TrainerConfig.  Weights are now
+   controlled exclusively by CompositeLoss.set_phase(), eliminating the
+   inconsistency between trainer.py and composite.py weight definitions.
+
+4. grad_clip reduced to 0.5 (from 1.0) for more stable phase-2 training.
 """
 
 from __future__ import annotations
@@ -42,23 +50,23 @@ log = logging.getLogger(__name__)
 @dataclass
 class TrainerConfig:
     # ── paths ──────────────────────────────────────────────────────────────
-    data_root: str = "dataset/UIEB"  # root that contains raw/ & reference/
+    data_root: str = "dataset/UIEB"
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "runs/p_uwdm"
 
     # ── training schedule ──────────────────────────────────────────────────
     total_epochs: int = 100
-    phase1_epochs: int = 50  # Phase-1: no discriminator
+    phase1_epochs: int = 80  # FIXED: was 50 — need longer pure-diffusion warmup
 
     # ── optimiser ──────────────────────────────────────────────────────────
     lr_generator: float = 2e-4
     lr_discriminator: float = 1e-4
     weight_decay: float = 1e-2
     betas: tuple = (0.9, 0.999)
-    grad_clip: float = 1.0
+    grad_clip: float = 0.5  # FIXED: reduced from 1.0
 
     # ── data ───────────────────────────────────────────────────────────────
-    batch_size: int = 16  # fits 4090 @ bfloat16
+    batch_size: int = 16
     num_workers: int = 8
     pin_memory: bool = True
     prefetch_factor: int = 2
@@ -68,30 +76,22 @@ class TrainerConfig:
     num_train_timesteps: int = 1000
 
     # ── precision ──────────────────────────────────────────────────────────
-    use_amp: bool = True  # bfloat16 on Ampere+
-    compile_model: bool = True  # torch.compile (PyTorch ≥ 2.0)
+    use_amp: bool = True
+    compile_model: bool = True
 
     # ── EMA ────────────────────────────────────────────────────────────────
     ema_decay: float = 0.9999
-    ema_update_every: int = 10  # steps between EMA updates
+    ema_update_every: int = 10
 
     # ── checkpointing ──────────────────────────────────────────────────────
     save_every_n_epochs: int = 5
     keep_last_n_checkpoints: int = 3
 
-    # ── loss weights (passed straight to CompositeLoss) ───────────────────
-    loss_weights: dict = field(
-        default_factory=lambda: {
-            "diffusion": 1.0,
-            "adversarial": 0.1,
-            "perceptual": 0.05,
-            "histogram": 0.1,
-            "contrastive": 0.05,
-        }
-    )
-
-    # ── model config (forwarded to PUWDMConfig) ───────────────────────────
+    # ── model config ───────────────────────────────────────────────────────
     model: PUWDMConfig = field(default_factory=PUWDMConfig)
+
+    # NOTE: loss_weights removed — weights are now controlled by
+    # CompositeLoss.set_phase() to avoid config inconsistency.
 
 
 # ---------------------------------------------------------------------------
@@ -155,13 +155,10 @@ def _prune_old_checkpoints(ckpt_dir: Path, keep: int) -> None:
 
 class PUWDMTrainer:
     """
-    Two-phase trainer for P-UWDM.
+    Two-phase trainer for P-UWDM (fixed).
 
-    Usage
-    -----
-    >>> cfg = TrainerConfig()
-    >>> trainer = PUWDMTrainer(cfg)
-    >>> trainer.fit()
+    Phase 1 (epochs 1–80):   Diffusion loss only.  No image-level losses.
+    Phase 2 (epochs 81–100): Diffusion + light perceptual (low timesteps).
     """
 
     def __init__(self, cfg: TrainerConfig) -> None:
@@ -169,11 +166,9 @@ class PUWDMTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if cfg.use_amp else torch.float32
 
-        # ── directories ────────────────────────────────────────────────────
         self.ckpt_dir = Path(cfg.checkpoint_dir)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── logging ────────────────────────────────────────────────────────
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s  %(levelname)-7s  %(message)s",
@@ -181,7 +176,6 @@ class PUWDMTrainer:
         )
         self.writer = SummaryWriter(log_dir=cfg.log_dir)
 
-        # ── build components ───────────────────────────────────────────────
         self._build_data()
         self._build_model()
         self._build_loss()
@@ -223,33 +217,23 @@ class PUWDMTrainer:
         self.model = PUWDM(cfg.model).to(self.device)
         if cfg.compile_model:
             log.info("torch.compile() — this takes ~60 s on first run …")
-            self.model = torch.compile(self.model)  # type: ignore[assignment]
+            self.model = torch.compile(self.model)
         log.info("Model params: %s M", f"{_count_params(self.model) / 1e6:.1f}")
 
     def _build_loss(self) -> None:
-        w = self.cfg.loss_weights
-        self.criterion = CompositeLoss(
-            weights=LossWeights(
-                diffusion=w["diffusion"],
-                adversarial=w["adversarial"],
-                perceptual=w["perceptual"],
-                histogram=w["histogram"],
-                contrastive=w["contrastive"],
-            )
-        ).to(self.device)
+        # Weights are set by set_phase() — no override from config.
+        self.criterion = CompositeLoss().to(self.device)
 
     def _build_optimisers(self) -> None:
         cfg = self.cfg
 
-        # Generator: all PUWDM parameters
         self.opt_g = AdamW(
             self.model.parameters(),
             lr=cfg.lr_generator,
             betas=cfg.betas,
             weight_decay=cfg.weight_decay,
         )
-
-        # Discriminator: lives inside CompositeLoss's adversarial loss
+        # Discriminator optimiser kept for checkpoint compat, but not stepped.
         self.opt_d = AdamW(
             self.criterion.discriminator.parameters(),
             lr=cfg.lr_discriminator,
@@ -284,8 +268,10 @@ class PUWDMTrainer:
     def _enter_phase1(self) -> None:
         log.info("═" * 60)
         log.info(
-            "PHASE 1  (epochs 1–%d): generator-only training", self.cfg.phase1_epochs
+            "PHASE 1  (epochs 1–%d): DIFFUSION LOSS ONLY",
+            self.cfg.phase1_epochs,
         )
+        log.info("  eps_pred std should rise from ~0.1 → ~1.0 by epoch 40")
         log.info("═" * 60)
         self.criterion.set_phase(1)
         _freeze(self.criterion.discriminator)
@@ -293,26 +279,19 @@ class PUWDMTrainer:
     def _enter_phase2(self) -> None:
         log.info("═" * 60)
         log.info(
-            "PHASE 2  (epochs %d–%d): full adversarial training",
+            "PHASE 2  (epochs %d–%d): diffusion + perceptual (t<200 only)",
             self.cfg.phase1_epochs + 1,
             self.cfg.total_epochs,
         )
         log.info("═" * 60)
         self.criterion.set_phase(2)
-        _unfreeze(self.criterion.discriminator)
+        # Discriminator stays frozen — no adversarial training
 
     # ------------------------------------------------------------------
     # Core train / val steps
     # ------------------------------------------------------------------
 
     def _train_step(self, batch: dict, phase: int) -> dict[str, float]:
-        """
-        Returns a dict of scalar losses for logging.
-        `batch` keys expected from PhysicsUIEBDataset:
-            raw        – degraded image  [B,3,H,W]
-            reference  – clean target    [B,3,H,W]
-            (physics estimators are run inside PUWDM.training_step)
-        """
         self.model.train()
         device, dtype = self.device, self.dtype
 
@@ -323,11 +302,8 @@ class PUWDMTrainer:
         degradation = batch["degradation"].to(device, non_blocking=True)
         severity = batch["severity"].to(device, non_blocking=True)
 
-        # ── sample random timestep ─────────────────────────────────────
         B = raw.size(0)
-        t = torch.randint(0, self.cfg.num_train_timesteps, (B,), device=device)
 
-        # ── forward pass (bfloat16) ────────────────────────────────────
         with torch.autocast(device_type="cuda", dtype=dtype, enabled=self.cfg.use_amp):
             step_out = self.model.training_step(
                 {
@@ -339,8 +315,6 @@ class PUWDMTrainer:
                     "severity": severity,
                 }
             )
-            # step_out keys: x_noisy, noise_pred, x0_pred, x_ref, x_raw, t
-
             loss_dict = self.criterion(
                 noise_pred=step_out["noise_pred"],
                 noise_target=step_out["noise_target"],
@@ -352,47 +326,23 @@ class PUWDMTrainer:
             )
             g_loss = loss_dict["total"]
 
-        # ── generator update ───────────────────────────────────────────
+        # Generator update
         self.opt_g.zero_grad(set_to_none=True)
-        self.scaler.scale(g_loss).backward(retain_graph=(phase == 2))
+        self.scaler.scale(g_loss).backward()
         self.scaler.unscale_(self.opt_g)
-        nn.utils.clip_grad_norm_(
-            [p for p in self.model.parameters() if "discriminator" not in str(p)],
-            self.cfg.grad_clip,
-        )
+        nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
         self.scaler.step(self.opt_g)
-
-        # ── discriminator update (phase 2 only) ───────────────────────
-        d_loss_val = 0.0
-        if phase == 2:
-            with torch.autocast(
-                device_type="cuda", dtype=dtype, enabled=self.cfg.use_amp
-            ):
-                d_loss = self.criterion.discriminator_loss(
-                    real=ref,
-                    fake=step_out["enhanced"],
-                    condition=raw,
-                )
-            self.opt_d.zero_grad(set_to_none=True)
-            self.scaler.scale(d_loss).backward()
-            self.scaler.unscale_(self.opt_d)
-            nn.utils.clip_grad_norm_(
-                self.criterion.discriminator.parameters(), self.cfg.grad_clip
-            )
-            self.scaler.step(self.opt_d)
-            d_loss_val = d_loss.item()
-
         self.scaler.update()
         self.global_step += 1
 
-        # ── EMA update ─────────────────────────────────────────────────
+        # EMA update
         if self.global_step % self.cfg.ema_update_every == 0:
             self.model.update_ema()
 
         return {
             k: v.item() if isinstance(v, torch.Tensor) else v
             for k, v in loss_dict.items()
-        } | {"d_loss": d_loss_val}
+        }
 
     @torch.no_grad()
     def _val_step(self, batch: dict) -> float:
@@ -404,8 +354,7 @@ class PUWDMTrainer:
         transmission = batch["transmission"].to(device, non_blocking=True)
         degradation = batch["degradation"].to(device, non_blocking=True)
         severity = batch["severity"].to(device, non_blocking=True)
-        B = raw.size(0)
-        t = torch.randint(0, self.cfg.num_train_timesteps, (B,), device=device)
+
         with torch.autocast(device_type="cuda", dtype=dtype, enabled=self.cfg.use_amp):
             step_out = self.model.training_step(
                 {
@@ -417,16 +366,15 @@ class PUWDMTrainer:
                     "severity": severity,
                 }
             )
-            loss_dict = self.criterion(
-                noise_pred=step_out["noise_pred"],
-                noise_target=step_out["noise_target"],
-                timesteps=step_out["timesteps"],
-                alphas_cumprod=step_out["alphas_cumprod"],
-                enhanced=step_out["enhanced"],
-                reference=ref,
-                raw=raw,
+            # Validation always uses phase-1 weights (diffusion only) for a
+            # clean, comparable signal across both phases.
+            val_loss = self.criterion.diffusion_loss(
+                step_out["noise_pred"],
+                step_out["noise_target"],
+                step_out["timesteps"],
+                step_out["alphas_cumprod"],
             )
-        return loss_dict["total"].item()
+        return val_loss.item()
 
     # ------------------------------------------------------------------
     # Epoch loops
@@ -442,9 +390,6 @@ class PUWDMTrainer:
             for k, v in losses.items():
                 running[k] = running.get(k, 0.0) + v
 
-            self.global_step += 1
-
-            # log every 20 steps
             if (i + 1) % 20 == 0:
                 step_losses = {k: v / (i + 1) for k, v in running.items()}
                 log.info(
@@ -459,10 +404,11 @@ class PUWDMTrainer:
         avg = {k: v / n_batches for k, v in running.items()}
         elapsed = time.perf_counter() - t0
         log.info(
-            "Epoch %3d/%d  [train]  total=%.4f  time=%.0fs",
+            "Epoch %3d/%d  [train]  total=%.4f  diff=%.4f  time=%.0fs",
             epoch,
             self.cfg.total_epochs,
             avg.get("total", 0),
+            avg.get("diffusion", 0),
             elapsed,
         )
         return avg
@@ -472,7 +418,12 @@ class PUWDMTrainer:
         for batch in self.val_loader:
             total += self._val_step(batch)
         avg = total / len(self.val_loader)
-        log.info("Epoch %3d/%d  [val]    total=%.4f", epoch, self.cfg.total_epochs, avg)
+        log.info(
+            "Epoch %3d/%d  [val]    diff_loss=%.4f",
+            epoch,
+            self.cfg.total_epochs,
+            avg,
+        )
         return avg
 
     # ------------------------------------------------------------------
@@ -480,9 +431,8 @@ class PUWDMTrainer:
     # ------------------------------------------------------------------
 
     def _try_resume(self, ckpt_path: Optional[str]) -> int:
-        """Returns start_epoch (1-based).  Pass None to start fresh."""
         if ckpt_path is None:
-            return 1  # fresh training run — do NOT auto-detect old checkpoints
+            return 1
 
         log.info("Resuming from %s", ckpt_path)
         ck = torch.load(ckpt_path, map_location=self.device, weights_only=False)
@@ -515,31 +465,26 @@ class PUWDMTrainer:
 
         for epoch in range(start_epoch, cfg.total_epochs + 1):
 
-            # phase transition
             if epoch == cfg.phase1_epochs + 1 and phase == 1:
                 self._enter_phase2()
                 phase = 2
 
-            # ── train ─────────────────────────────────────────────────
             train_losses = self._run_epoch(epoch, phase=phase)
-
-            # ── val ───────────────────────────────────────────────────
             val_loss = self._run_val(epoch)
 
-            # ── schedulers ────────────────────────────────────────────
             self.sched_g.step()
-            if phase == 2:
-                self.sched_d.step()
 
-            # ── tensorboard ───────────────────────────────────────────
             for k, v in train_losses.items():
                 self.writer.add_scalar(f"train/{k}", v, epoch)
-            self.writer.add_scalar("val/total_loss", val_loss, epoch)
+            self.writer.add_scalar("val/diffusion_loss", val_loss, epoch)
             self.writer.add_scalar(
                 "lr/generator", self.opt_g.param_groups[0]["lr"], epoch
             )
 
-            # ── checkpoint ────────────────────────────────────────────
+            # Log eps_pred std every 10 epochs as a health check
+            if epoch % 10 == 0:
+                self._log_eps_std(epoch)
+
             is_best = val_loss < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_loss
@@ -570,4 +515,48 @@ class PUWDMTrainer:
                 _prune_old_checkpoints(self.ckpt_dir, cfg.keep_last_n_checkpoints)
 
         self.writer.close()
-        log.info("Training complete. Best val loss: %.4f", self.best_val_loss)
+        log.info("Training complete. Best val diff_loss: %.4f", self.best_val_loss)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _log_eps_std(self, epoch: int) -> None:
+        """
+        Log eps_pred std on a single batch — should approach ~1.0 as the
+        denoiser learns to correctly predict unit-variance noise.
+        Values well below 1.0 (< 0.5) indicate noise prediction collapse.
+        """
+        self.model.eval()
+        try:
+            batch = next(iter(self.val_loader))
+        except StopIteration:
+            return
+
+        device, dtype = self.device, self.dtype
+        raw = batch["raw"].to(device)
+        ref = batch["reference"].to(device)
+        ambient = batch["ambient"].to(device)
+        transmission = batch["transmission"].to(device)
+        degradation = batch["degradation"].to(device)
+        severity = batch["severity"].to(device)
+
+        with torch.autocast(device_type="cuda", dtype=dtype, enabled=self.cfg.use_amp):
+            step_out = self.model.training_step(
+                {
+                    "raw": raw,
+                    "reference": ref,
+                    "ambient": ambient,
+                    "transmission": transmission,
+                    "degradation": degradation,
+                    "severity": severity,
+                }
+            )
+        eps_std = step_out["noise_pred"].float().std().item()
+        log.info(
+            "Epoch %3d  eps_pred std=%.4f  (target ~1.0;  <0.5 = collapse)",
+            epoch,
+            eps_std,
+        )
+        self.writer.add_scalar("diag/eps_pred_std", eps_std, epoch)
