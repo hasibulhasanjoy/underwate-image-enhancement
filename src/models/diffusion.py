@@ -5,14 +5,29 @@ DDPM / DDIM Diffusion Process for P-UWDM.
 
 Responsibilities
 ────────────────
-1. **Noise schedule** — cosine β-schedule (Nichol & Dhariwal 2021), which
-   avoids the abrupt SNR drop at t→T that the linear schedule suffers from.
+1. **Noise schedule** — cosine β-schedule (Nichol & Dhariwal 2021).
 2. **Forward process** — q(x_t | x_0) = N(√ᾱ_t · x_0, (1-ᾱ_t) · I).
-   Returns the noisy image and the noise sample used to produce it.
-3. **DDIM reverse / sampling** — deterministic (η=0) or stochastic (η>0)
-   reverse step following Song et al. 2020 (DDIM).  50-step accelerated
-   sampling uses a subsequence capped at T_max where ᾱ_t >= 0.01.
+3. **DDIM reverse / sampling** — deterministic (η=0) reverse step.
+   50-step accelerated sampling uses a full subsequence from t=T-1 → 0.
 4. **Utility** — SNR / ᾱ look-up helpers used by DiffusionLoss.
+
+Key fix (v2)
+────────────
+The original ddim_sample_loop capped the starting timestep at T_max
+(last t where ᾱ_t >= 0.01, ≈ 934).  This was wrong for two reasons:
+
+  1. DDIM must start from x_T ~ N(0,I) which corresponds to t = T-1 = 999
+     (ᾱ_999 ≈ 0.00009 with cosine schedule — essentially pure noise).
+     Starting at t=934 with ᾱ=0.01 is mid-chain noise, not the correct
+     starting distribution, causing the sampling to be incoherent.
+
+  2. At t=934, sqrt_recip_alphas_cumprod = 1/sqrt(0.01) = 10, so
+     predict_x0_from_eps amplifies eps_pred by 10× before clamping,
+     producing garbage x0_pred in every early DDIM step.
+
+The fix: remove the T_max cap entirely.  Always start from t=T-1=999.
+The cosine schedule at t=999 has ᾱ≈0.00009, so x_T is correctly dominated
+by Gaussian noise and the denoiser unrolls cleanly from full noise → image.
 
 API summary
 ───────────
@@ -29,18 +44,6 @@ API summary
                 device=device,
                 num_steps=50,
             )
-
-Design notes
-────────────
-- All schedule tensors live on CPU and are moved to the appropriate device
-  on first use via `.to(device)`.  This avoids CUDA initialisation in
-  DataLoader workers.
-- The scheduler is stateless between calls; it holds only the pre-computed
-  schedule tables.
-- `ddim_sample_loop` accepts an arbitrary `model_fn` so it can be used with
-  the full P-UWDM forward pass or with classifier-free guidance in future.
-- T_max is capped at the last t where ᾱ_t >= 0.01 to avoid the near-zero
-  signal region (t > 934 with cosine schedule) which produces pure noise.
 """
 
 from __future__ import annotations
@@ -115,7 +118,7 @@ class DDIMScheduler:
         self.register("alphas_cumprod", alphas_cumprod)
         self.register("alphas_cumprod_prev", alphas_cumprod_prev)
 
-        # Derived quantities used in posterior q(x_{t-1}|x_t, x_0)
+        # Derived quantities
         self.register("sqrt_alphas_cumprod", alphas_cumprod.sqrt())
         self.register("sqrt_one_minus_alphas_cumprod", (1.0 - alphas_cumprod).sqrt())
         self.register("log_one_minus_alphas_cumprod", (1.0 - alphas_cumprod).log())
@@ -125,7 +128,7 @@ class DDIMScheduler:
             (1.0 / alphas_cumprod - 1.0).sqrt(),
         )
 
-        # Posterior variance β̃_t = β_t · (1 - ᾱ_{t-1}) / (1 - ᾱ_t)
+        # Posterior variance β̃_t
         posterior_variance = (
             betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
         )
@@ -142,12 +145,6 @@ class DDIMScheduler:
             "posterior_mean_coef2",
             (1.0 - alphas_cumprod_prev) * alphas.sqrt() / (1.0 - alphas_cumprod),
         )
-
-        # Pre-compute T_max: last timestep where ᾱ_t >= 0.01
-        # (cosine schedule collapses to ~2e-9 at t=999; sampling above T_max
-        #  means starting from near-pure noise with no recoverable signal)
-        valid = (alphas_cumprod >= 0.01).nonzero(as_tuple=True)[0]
-        self._T_max = int(valid.max().item()) if len(valid) > 0 else T - 1
 
         self._device_cache: Dict[str, Tensor] = {}
 
@@ -217,7 +214,6 @@ class DDIMScheduler:
         recip_m1 = self._get("sqrt_recipm1_alphas_cumprod", t, device)
         x0_pred = recip * x_t - recip_m1 * eps
         if self.clip_denoised:
-            # Training images are in [0, 1] — clamp to keep reverse chain stable.
             x0_pred = x0_pred.clamp(0.0, 1.0)
         return x0_pred
 
@@ -237,16 +233,13 @@ class DDIMScheduler:
         """
         Single DDIM reverse step:  x_t  →  x_{t_prev}.
 
-        Song et al. (DDIM, 2020) equation 12:
-            x_{t-1} = √ᾱ_{t-1} · x̂_0
-                    + √(1 - ᾱ_{t-1} - σ²_t) · ε_θ(x_t, t)
-                    + σ_t · ε      (σ_t = 0 for deterministic DDIM)
+        When t_prev == 0, returns x0_pred directly (final clean image).
 
         Parameters
         ----------
         x_t      : (B, C, H, W)
         t        : (B,)  current timestep
-        t_prev   : (B,)  previous (lower) timestep in the subsequence
+        t_prev   : (B,)  previous (lower) timestep; use -1 for the final step
         eps_pred : (B, C, H, W)  noise prediction from the denoiser
         eta      : float  stochasticity (0 = deterministic DDIM)
 
@@ -256,11 +249,16 @@ class DDIMScheduler:
         """
         device = x_t.device
 
-        acp = self._get("alphas_cumprod", t, device)  # (B,1,1,1)
-        acp_prev = self._get("alphas_cumprod", t_prev, device)  # (B,1,1,1)
-
         # Predict x_0
         x0_pred = self.predict_x0_from_eps(x_t, t, eps_pred)
+
+        # On the very last step (t_prev == 0), just return the clean estimate
+        # rather than re-adding noise direction which would corrupt the output.
+        if t_prev[0].item() <= 0:
+            return x0_pred
+
+        acp = self._get("alphas_cumprod", t, device)  # (B,1,1,1)
+        acp_prev = self._get("alphas_cumprod", t_prev, device)  # (B,1,1,1)
 
         # DDIM direction coefficients
         sqrt_1m_acp_prev = (1.0 - acp_prev).sqrt()
@@ -300,14 +298,18 @@ class DDIMScheduler:
         """
         DDIM accelerated sampling.
 
-        Key fix: timestep subsequence is capped at self._T_max (the last t
-        where ᾱ_t >= 0.01).  The original loop started at t=980 where
-        ᾱ_980 = 0.00088 — essentially pure noise with no recoverable signal,
-        which is why all outputs were pure noise regardless of conditioning.
+        Always starts from t = T-1 (pure Gaussian noise) and steps down to
+        t = 0 over `num_steps` steps.  This is the correct DDIM procedure:
+        x_T ~ N(0, I) corresponds to ᾱ_T ≈ 0, i.e. nearly-pure noise.
+
+        The old T_max cap (starting at ᾱ_t = 0.01) was wrong — it caused
+        DDIM to start mid-chain where the input is only 99% noise but the
+        sampler treats it as if it were the initial pure-noise distribution,
+        producing incoherent outputs.
 
         Parameters
         ----------
-        model_fn  : callable  (x_t, t_tensor) → eps_pred (B, C, H, W)
+        model_fn  : callable  (x_t, t_tensor, **model_kwargs) → eps_pred
         shape     : (B, C, H, W)
         device    : torch.device
         num_steps : int    DDIM steps (default 50)
@@ -322,12 +324,15 @@ class DDIMScheduler:
         device = torch.device(device) if isinstance(device, str) else device
 
         # ── Timestep subsequence ──────────────────────────────────────────
-        # Cap at T_max where ᾱ_t >= 0.01 to stay in the recoverable region.
-        # With cosine schedule T=1000: T_max ~ 934, ᾱ_934 ~ 0.010.
-        T_max = self._T_max
-        timesteps = torch.linspace(T_max, 0, num_steps + 1).long()
-        t_seq = timesteps[:-1]  # [T_max, ..., small_t]  length=num_steps
-        t_prev_seq = timesteps[1:]  # [t-1,   ..., 0]        length=num_steps
+        # Always start from T-1 (= 999 for T=1000).
+        # t_seq  : [999, 979, ..., 19]   length = num_steps
+        # t_prev : [979, ..., 19,   0]   length = num_steps
+        #
+        # torch.linspace(T-1, 0, num_steps+1) gives exactly num_steps+1
+        # evenly-spaced values from T-1 down to 0 inclusive.
+        timesteps = torch.linspace(self.T - 1, 0, num_steps + 1).long()
+        t_seq = timesteps[:-1]  # [T-1, ..., small_t]  length=num_steps
+        t_prev_seq = timesteps[1:]  # [t-1, ...,  0]        length=num_steps
 
         # ── Starting noise ────────────────────────────────────────────────
         x = x_T if x_T is not None else torch.randn(shape, device=device)
@@ -379,7 +384,7 @@ class DDIMScheduler:
     def __repr__(self) -> str:
         acp = self.alphas_cumprod
         return (
-            f"DDIMScheduler(T={self.T}, T_max={self._T_max}, "
-            f"ᾱ_min={acp.min():.4f}, ᾱ_max={acp.max():.4f}, "
+            f"DDIMScheduler(T={self.T}, "
+            f"ᾱ_min={acp.min():.6f}, ᾱ_max={acp.max():.4f}, "
             f"clip_denoised={self.clip_denoised})"
         )

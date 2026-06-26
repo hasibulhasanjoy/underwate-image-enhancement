@@ -82,23 +82,15 @@ def _import_skimage():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ImageNet denorm (mirrors physics_dataset.py)
+# Tensor utilities
 # ──────────────────────────────────────────────────────────────────────────────
-
-_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-
-
-def denorm(t: Tensor) -> Tensor:
-    """ImageNet-normalised tensor → [0, 1] float32."""
-    mean = _IMAGENET_MEAN.to(t.device)
-    std = _IMAGENET_STD.to(t.device)
-    return (t * std + mean).clamp_(0.0, 1.0)
 
 
 def to_uint8(t: Tensor) -> np.ndarray:
     """(C, H, W) float [0,1] tensor → (H, W, C) uint8 numpy array."""
-    return (t.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    return (
+        (t.permute(1, 2, 0).cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -116,17 +108,13 @@ def compute_uciqe(img_uint8: np.ndarray) -> float:
     lab = rgb2lab(img_uint8.astype(np.float32) / 255.0)
     L, a, b = lab[:, :, 0], lab[:, :, 1], lab[:, :, 2]
 
-    # Chroma
     chroma = np.sqrt(a**2 + b**2)
     sigma_c = chroma.std()
 
-    # Saturation
-    # Avoid division by zero where L≈0
     with np.errstate(divide="ignore", invalid="ignore"):
         sat = np.where(L > 1e-6, chroma / L, 0.0)
     mean_s = sat.mean()
 
-    # Luminance contrast (top 1% - bottom 1% of L)
     L_flat = L.flatten()
     con_l = np.percentile(L_flat, 99) - np.percentile(L_flat, 1)
 
@@ -141,7 +129,6 @@ def compute_uciqe(img_uint8: np.ndarray) -> float:
 
 
 def _uicm(img_rgb: np.ndarray) -> float:
-    """Underwater Image Colorfulness Measure."""
     R = img_rgb[:, :, 0].astype(np.float64)
     G = img_rgb[:, :, 1].astype(np.float64)
     B = img_rgb[:, :, 2].astype(np.float64)
@@ -149,28 +136,24 @@ def _uicm(img_rgb: np.ndarray) -> float:
     YB = (R + G) / 2.0 - B
     mu_rg, sigma_rg = RG.mean(), RG.std()
     mu_yb, sigma_yb = YB.mean(), YB.std()
-    # Asymmetric alpha-trim not strictly needed for thesis; using simpler form
     l = math.sqrt(mu_rg**2 + mu_yb**2)
     r = math.sqrt(sigma_rg**2 + sigma_yb**2)
     return -0.0268 * l + 0.1586 * r
 
 
 def _uism(img_rgb: np.ndarray) -> float:
-    """Underwater Image Sharpness Measure (via Sobel on each channel)."""
     from skimage.filters import sobel
 
     val = 0.0
-    weights = [0.299, 0.587, 0.114]  # R, G, B luminance weights
+    weights = [0.299, 0.587, 0.114]
     for c, w in enumerate(weights):
         ch = img_rgb[:, :, c].astype(np.float64) / 255.0
         edge = sobel(ch)
-        # EME on the edge map (block-based)
         val += w * _eme(edge)
     return val
 
 
 def _eme(img: np.ndarray, block: int = 8) -> float:
-    """Enhancement Measure Estimation."""
     H, W = img.shape
     bH = H // block
     bW = W // block
@@ -189,7 +172,6 @@ def _eme(img: np.ndarray, block: int = 8) -> float:
 
 
 def _uiconm(img_rgb: np.ndarray, block: int = 8) -> float:
-    """Underwater Image Contrast Measure."""
     gray = (
         0.299 * img_rgb[:, :, 0] + 0.587 * img_rgb[:, :, 1] + 0.114 * img_rgb[:, :, 2]
     ).astype(np.float64) / 255.0
@@ -197,11 +179,6 @@ def _uiconm(img_rgb: np.ndarray, block: int = 8) -> float:
 
 
 def compute_uiqm(img_uint8: np.ndarray) -> float:
-    """
-    UIQM from uint8 RGB (H, W, 3).
-    UIQM = c1*UICM + c2*UISM + c3*UIConM
-    c1=0.0282, c2=0.2953, c3=3.5753  (Panetta et al. 2016)
-    """
     c1, c2, c3 = 0.0282, 0.2953, 3.5753
     uicm = _uicm(img_uint8)
     uism = _uism(img_uint8)
@@ -231,6 +208,31 @@ def _strip_compiled_prefix(state_dict: dict) -> dict:
     return stripped
 
 
+def _fix_ema_keys(ema_state: dict) -> dict:
+    """
+    Fix EMA shadow dict keys for clean loading into model.denoiser.
+
+    EMAModel is initialised with model.denoiser (not model), so its shadow
+    keys are bare denoiser parameter names like 'patch_embed.proj.weight'
+    — no 'denoiser.' prefix.
+
+    torch.compile may prepend '_orig_mod.' which we strip here.
+    We do NOT strip 'denoiser.' because the EMA shadow never has it.
+    """
+    out = {}
+    for k, v in ema_state.items():
+        # Strip _orig_mod. prefix from torch.compile
+        k = k.replace("_orig_mod.", "")
+        out[k] = v
+
+    log.info(
+        "EMA key fix: %d keys. Sample keys: %s",
+        len(out),
+        list(out.keys())[:3],
+    )
+    return out
+
+
 def load_model(checkpoint_path: str, device: torch.device):
     """Load PUWDM from a training checkpoint and return it in eval mode."""
     from src.models.p_uwdm import PUWDM, PUWDMConfig
@@ -240,26 +242,41 @@ def load_model(checkpoint_path: str, device: torch.device):
 
     model = PUWDM(PUWDMConfig())
     model_state = _strip_compiled_prefix(ck["model_state"])
-    model.load_state_dict(model_state)
+    missing, unexpected = model.load_state_dict(model_state, strict=False)
+    if missing:
+        log.warning("Missing keys in model_state (%d): %s", len(missing), missing[:5])
+    if unexpected:
+        log.warning(
+            "Unexpected keys in model_state (%d): %s", len(unexpected), unexpected[:5]
+        )
 
     # Apply EMA weights for inference if available
     ema_state = ck.get("ema_state")
     if ema_state is not None and model._ema is not None:
-        # EMA shadow keys may carry _orig_mod. prefix from torch.compile
-        # and may be scoped as 'denoiser.X' or '_orig_mod.denoiser.X'
-        def _fix_ema_keys(sd):
-            out = {}
-            for k, v in sd.items():
-                k = k.replace("_orig_mod.", "")
-                out[k] = v
-            # Only strip "denoiser." if ALL keys carry it
-            if out and all(k.startswith("denoiser.") for k in out):
-                out = {k[len("denoiser.") :]: v for k, v in out.items()}
-            return out
+        fixed_ema = _fix_ema_keys(ema_state)
 
-        model._ema.shadow = _fix_ema_keys(ema_state)
-        model._ema.copy_to(model.denoiser)
-        log.info("EMA weights applied to denoiser.")
+        # Verify the fixed keys match the denoiser parameter names
+        denoiser_param_names = {n for n, _ in model.denoiser.named_parameters()}
+        ema_keys = set(fixed_ema.keys())
+        overlap = ema_keys & denoiser_param_names
+        log.info(
+            "EMA key overlap with denoiser params: %d/%d (ema) / %d (denoiser)",
+            len(overlap),
+            len(ema_keys),
+            len(denoiser_param_names),
+        )
+
+        if len(overlap) > len(denoiser_param_names) * 0.9:
+            # Good match — load EMA weights
+            model._ema.shadow = fixed_ema
+            model._ema.copy_to(model.denoiser)
+            log.info("EMA weights applied to denoiser.")
+        else:
+            log.warning(
+                "EMA key overlap too low (%d/%d) — falling back to raw model weights.",
+                len(overlap),
+                len(denoiser_param_names),
+            )
     else:
         log.info("No EMA state found — using raw model weights.")
 
@@ -273,7 +290,7 @@ def load_model(checkpoint_path: str, device: torch.device):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Build test DataLoader from existing PhysicsUIEBDataModule
+# Build test DataLoader
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -314,6 +331,8 @@ def evaluate_batch(
     """
     Run inference + metric computation on a single batch.
     Returns a list of per-image metric dicts.
+
+    Images are in [0, 1] throughout — no ImageNet normalisation is used.
     """
     raw = batch["raw"].to(device)
     reference = batch["reference"].to(device)
@@ -333,12 +352,23 @@ def evaluate_batch(
             eta=0.0,
             use_ema=True,
             progress=False,
-        )  # (B, 3, H, W) in [0, 1]
+        )  # (B, 3, H, W)  already in [0, 1] — no denorm needed
 
-    # Training used no ImageNet normalisation — images are already in [0, 1].
+    # Clamp to [0, 1] — training pipeline uses no ImageNet normalisation
     enhanced_01 = enhanced_norm.clamp(0.0, 1.0)
     raw_01 = raw.clamp(0.0, 1.0)
     ref_01 = reference.clamp(0.0, 1.0)
+
+    # Log min/max of first image in batch for debugging
+    log.debug(
+        "enhanced range: [%.4f, %.4f]  raw: [%.4f, %.4f]",
+        enhanced_01[0].min().item(),
+        enhanced_01[0].max().item(),
+        raw_01[0].min().item(),
+        raw_01[0].max().item(),
+    )
+
+    lpips_mod = sys.modules.get("lpips")
 
     B = raw_01.shape[0]
     results = []
@@ -365,7 +395,7 @@ def evaluate_batch(
         ref_lpips = ref_01[i : i + 1] * 2 - 1
         lpips_val = lpips_fn(enh_lpips.to(device), ref_lpips.to(device)).item()
 
-        # No-reference metrics on enhanced image
+        # No-reference metrics
         uciqe_val = compute_uciqe(enh_np)
         uiqm_val = compute_uiqm(enh_np)
 
@@ -500,7 +530,6 @@ def main():
         for img_result in per_img:
             global_idx = len(all_results)
 
-            # Save visual grid
             if args.save_visuals and (
                 args.max_visuals == 0 or visual_count < args.max_visuals
             ):
@@ -513,7 +542,6 @@ def main():
                 )
                 visual_count += 1
 
-            # Strip tensor fields before storing
             metrics = {k: v for k, v in img_result.items() if not k.startswith("_")}
             metrics["idx"] = global_idx
             all_results.append(metrics)
@@ -563,7 +591,7 @@ def main():
         writer.writerows(all_results)
     log.info("Per-image CSV → %s", csv_path)
 
-    # ── Save aggregate JSON (easy to load in thesis notebook) ─────────────
+    # ── Save aggregate JSON ───────────────────────────────────────────────
     json_path = out_dir / "aggregate.json"
     json_path.write_text(
         json.dumps(
