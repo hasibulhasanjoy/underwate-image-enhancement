@@ -154,6 +154,10 @@ class EMAModel:
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
+            # Move shadow to param's device on first encounter (model may have
+            # been moved to CUDA after EMA was initialised on CPU).
+            if self.shadow[name].device != param.device:
+                self.shadow[name] = self.shadow[name].to(param.device)
             self.shadow[name].mul_(self.decay).add_(
                 param.data.float(), alpha=1.0 - self.decay
             )
