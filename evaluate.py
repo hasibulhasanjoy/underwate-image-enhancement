@@ -208,31 +208,6 @@ def _strip_compiled_prefix(state_dict: dict) -> dict:
     return stripped
 
 
-def _fix_ema_keys(ema_state: dict) -> dict:
-    """
-    Fix EMA shadow dict keys for clean loading into model.denoiser.
-
-    EMAModel is initialised with model.denoiser (not model), so its shadow
-    keys are bare denoiser parameter names like 'patch_embed.proj.weight'
-    — no 'denoiser.' prefix.
-
-    torch.compile may prepend '_orig_mod.' which we strip here.
-    We do NOT strip 'denoiser.' because the EMA shadow never has it.
-    """
-    out = {}
-    for k, v in ema_state.items():
-        # Strip _orig_mod. prefix from torch.compile
-        k = k.replace("_orig_mod.", "")
-        out[k] = v
-
-    log.info(
-        "EMA key fix: %d keys. Sample keys: %s",
-        len(out),
-        list(out.keys())[:3],
-    )
-    return out
-
-
 def load_model(checkpoint_path: str, device: torch.device):
     """Load PUWDM from a training checkpoint and return it in eval mode."""
     from src.models.p_uwdm import PUWDM, PUWDMConfig
@@ -240,6 +215,7 @@ def load_model(checkpoint_path: str, device: torch.device):
     log.info("Loading checkpoint: %s", checkpoint_path)
     ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
+    # Instantiate a plain (uncompiled) model for inference
     model = PUWDM(PUWDMConfig())
     model_state = _strip_compiled_prefix(ck["model_state"])
     missing, unexpected = model.load_state_dict(model_state, strict=False)
@@ -250,39 +226,17 @@ def load_model(checkpoint_path: str, device: torch.device):
             "Unexpected keys in model_state (%d): %s", len(unexpected), unexpected[:5]
         )
 
-    # Apply EMA weights for inference if available
-    ema_state = ck.get("ema_state")
-    if ema_state is not None and model._ema is not None:
-        fixed_ema = _fix_ema_keys(ema_state)
-
-        # Verify the fixed keys match the denoiser parameter names
-        denoiser_param_names = {n for n, _ in model.denoiser.named_parameters()}
-        ema_keys = set(fixed_ema.keys())
-        overlap = ema_keys & denoiser_param_names
-        log.info(
-            "EMA key overlap with denoiser params: %d/%d (ema) / %d (denoiser)",
-            len(overlap),
-            len(ema_keys),
-            len(denoiser_param_names),
-        )
-
-        if len(overlap) > len(denoiser_param_names) * 0.9:
-            # Good match — load EMA weights
-            model._ema.shadow = fixed_ema
-            model._ema.copy_to(model.denoiser)
-            log.info("EMA weights applied to denoiser.")
-        else:
-            log.warning(
-                "EMA key overlap too low (%d/%d) — falling back to raw model weights.",
-                len(overlap),
-                len(denoiser_param_names),
-            )
-    else:
-        log.info("No EMA state found — using raw model weights.")
-
     epoch = ck.get("epoch", "?")
     best = ck.get("best_val_loss", float("nan"))
     log.info("Checkpoint epoch=%s  best_val_loss=%.4f", epoch, best)
+
+    # Skip EMA entirely — use raw model weights.
+    # The EMA shadow was initialised when the model was still in early training
+    # (collapsed eps_pred std ~0.1). With decay=0.9999 over 100 epochs it never
+    # caught up to the raw weights (eps_pred std ~1.0+). Applying EMA reverts
+    # the model to a worse state. Disable it so model.sample() never swaps it in.
+    model._ema = None
+    log.info("Using raw model weights (EMA disabled — raw weights are better trained).")
 
     model.eval()
     model.to(device)
@@ -350,7 +304,7 @@ def evaluate_batch(
             severity=severity,
             num_steps=num_steps,
             eta=0.0,
-            use_ema=True,
+            use_ema=False,  # EMA disabled — raw weights already loaded
             progress=False,
         )  # (B, 3, H, W)  already in [0, 1] — no denorm needed
 
