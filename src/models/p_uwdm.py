@@ -113,7 +113,7 @@ class PUWDMConfig:
     diffusion_s: float = 0.008
     clip_denoised: bool = True
     use_ema: bool = True
-    ema_decay: float = 0.9999
+    ema_decay: float = 0.999
 
     def __post_init__(self) -> None:
         # Keep cond_embed_dim consistent between the wrapper and the denoiser
