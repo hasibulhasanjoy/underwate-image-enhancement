@@ -306,12 +306,22 @@ def evaluate_batch(
             eta=0.0,
             use_ema=False,  # EMA disabled — raw weights already loaded
             progress=False,
-        )  # (B, 3, H, W)  already in [0, 1] — no denorm needed
+        )  # (B, 3, H, W)  in ImageNet-normalized space — denormed below
 
-    # Clamp to [0, 1] — training pipeline uses no ImageNet normalisation
-    enhanced_01 = enhanced_norm.clamp(0.0, 1.0)
-    raw_01 = raw.clamp(0.0, 1.0)
-    ref_01 = reference.clamp(0.0, 1.0)
+    # Denormalize from ImageNet normalization back to [0, 1].
+    # Training dataset uses imagenet_normalised=True:
+    #   mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]
+    # Model output is in that same normalized space — must denorm before
+    # computing metrics (PSNR/SSIM) and saving visuals.
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    def denorm(t: torch.Tensor) -> torch.Tensor:
+        return (t * std + mean).clamp(0.0, 1.0)
+
+    enhanced_01 = denorm(enhanced_norm)
+    raw_01 = denorm(raw)
+    ref_01 = denorm(reference)
 
     # Log min/max of first image in batch for debugging
     log.debug(
