@@ -21,16 +21,19 @@ Two-phase training:
     The denoiser must learn to predict noise correctly before any image-level
     losses are applied.  eps_pred std should converge to ~1.0 by epoch 40-50.
 
-  Phase 2 (epochs 81–100): diffusion + perceptual (low weight).
-    Perceptual loss is only applied when the timestep is "low" (t < 200),
-    i.e. when x0_pred is a meaningful near-clean estimate.  Adversarial,
-    histogram, and contrastive are disabled — they provide marginal benefit
-    for a dataset of ~890 images and can destabilise training.
+  Phase 2 (epochs 81–100): diffusion + perceptual + histogram (low weight).
+    Perceptual and histogram losses are only applied when the timestep is
+    "low" (t < 200), i.e. when x0_pred is a meaningful near-clean estimate.
+    Histogram loss targets the compressed dynamic range / colour-cast issue
+    (enhanced std ~0.17 vs reference ~0.20) that perceptual loss alone does
+    not fix.  Adversarial and contrastive remain disabled — they provide
+    marginal benefit for a dataset of ~890 images and can destabilise
+    training.
 
 Loss weights
 ────────────
   Phase 1:  λ_diff=1.0,  all others=0.0
-  Phase 2:  λ_diff=1.0,  λ_perc=0.05,  all others=0.0
+  Phase 2:  λ_diff=1.0,  λ_perc=0.05,  λ_hist=0.1,  all others=0.0
 """
 
 from __future__ import annotations
@@ -68,12 +71,12 @@ class LossWeights:
 
     @classmethod
     def phase2(cls) -> "LossWeights":
-        """Phase 2: add light perceptual loss at low timesteps only."""
+        """Phase 2: add light perceptual + histogram loss at low timesteps only."""
         return cls(
             diffusion=1.0,
             adversarial=0.0,
             perceptual=0.05,
-            histogram=0.0,
+            histogram=0.1,
             contrastive=0.0,
         )
 
@@ -191,14 +194,28 @@ class CompositeLoss(nn.Module):
         else:
             losses["perceptual"] = zero
 
-        # Histogram (disabled — kept for API compat)
-        losses["histogram"] = zero
+        # Histogram — CDF matching at low timesteps only (same gating as perceptual)
+        if (
+            w.histogram > 0.0
+            and has_low_t
+            and enhanced is not None
+            and reference is not None
+        ):
+            enh_low = enhanced[low_t_mask]
+            ref_low = reference[low_t_mask]
+            losses["histogram"] = self.histogram_loss(enh_low, ref_low)
+        else:
+            losses["histogram"] = zero
 
         # Contrastive (disabled — kept for API compat)
         losses["contrastive"] = zero
 
         # Weighted sum
-        total = w.diffusion * losses["diffusion"] + w.perceptual * losses["perceptual"]
+        total = (
+            w.diffusion * losses["diffusion"]
+            + w.perceptual * losses["perceptual"]
+            + w.histogram * losses["histogram"]
+        )
         losses["total"] = total
         return losses
 

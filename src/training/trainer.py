@@ -279,7 +279,7 @@ class PUWDMTrainer:
     def _enter_phase2(self) -> None:
         log.info("═" * 60)
         log.info(
-            "PHASE 2  (epochs %d–%d): diffusion + perceptual (t<200 only)",
+            "PHASE 2  (epochs %d–%d): diffusion + perceptual + histogram (t<200 only)",
             self.cfg.phase1_epochs + 1,
             self.cfg.total_epochs,
         )
@@ -393,12 +393,13 @@ class PUWDMTrainer:
             if (i + 1) % 20 == 0:
                 step_losses = {k: v / (i + 1) for k, v in running.items()}
                 log.info(
-                    "  step %4d/%d  total=%.4f  diff=%.4f  perc=%.4f",
+                    "  step %4d/%d  total=%.4f  diff=%.4f  perc=%.4f  hist=%.4f",
                     i + 1,
                     n_batches,
                     step_losses.get("total", 0),
                     step_losses.get("diffusion", 0),
                     step_losses.get("perceptual", 0),
+                    step_losses.get("histogram", 0),
                 )
 
         avg = {k: v / n_batches for k, v in running.items()}
