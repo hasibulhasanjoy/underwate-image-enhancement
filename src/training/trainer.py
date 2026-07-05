@@ -449,6 +449,33 @@ class PUWDMTrainer:
             self.model._ema.shadow = ema_state
         return ck["epoch"] + 1
 
+    def load_weights_from(self, ckpt_path: str) -> None:
+        """
+        Load ONLY model + EMA weights from a checkpoint — no optimizer,
+        scheduler, epoch count, or best_val_loss.
+
+        Use this (instead of fit(resume_from=...)) when starting a new
+        fine-tuning phase with a different loss composition (e.g. adding
+        histogram loss). A literal resume would also restore the old,
+        already-decayed cosine LR schedule, effectively training the new
+        epochs at ~eta_min. This gives the extension run its own fresh
+        warmup + cosine decay instead.
+        """
+        log.info(
+            "Loading weights ONLY (fresh optimizer/scheduler/epoch count) from %s",
+            ckpt_path,
+        )
+        ck = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(ck["model_state"])
+        ema_state = ck.get("ema_state")
+        if ema_state is not None and getattr(self.model, "_ema", None) is not None:
+            self.model._ema.shadow = ema_state
+        log.info(
+            "Loaded weights from source checkpoint epoch %d; this run starts at epoch 1 "
+            "with a fresh LR schedule.",
+            ck.get("epoch", -1),
+        )
+
     # ------------------------------------------------------------------
     # Main fit loop
     # ------------------------------------------------------------------
