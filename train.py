@@ -2,11 +2,29 @@
 """
 train.py — P-UWDM training entry point (fixed).
 
-Usage:
-    python train.py                            # fresh 100-epoch run
-    python train.py --batch_size 4             # smaller batch (shared GPU)
-    python train.py --resume                   # resume from latest checkpoint
-    python train.py --checkpoint checkpoints/epoch_0050.pt --resume
+Three modes, all through this one script:
+
+1. Fresh run (random init):
+       python train.py --total_epochs 100 --phase1_epochs 80
+
+2. Full resume (restores model + optimizer + scheduler + epoch count —
+   use this to continue an interrupted run with no change in config):
+       python train.py --resume
+       python train.py --checkpoint checkpoints/epoch_0050.pt --resume
+
+3. Weights-only init (loads ONLY model + EMA weights from a checkpoint,
+   then starts a FRESH optimizer/scheduler/epoch count — use this when
+   starting a new fine-tuning phase with a different loss composition,
+   e.g. adding histogram loss on top of an already-trained model, so the
+   LR schedule gets a proper warmup + decay instead of inheriting an
+   already-decayed one):
+       python train.py --init_weights_from checkpoints/best.pt \\
+           --checkpoint_dir checkpoints_phase2_hist \\
+           --log_dir runs/p_uwdm_phase2_hist \\
+           --total_epochs 120 --phase1_epochs 0
+
+Examples for the shared-GPU / small-VRAM case:
+    python train.py --batch_size 8             # smaller batch (shared GPU)
 """
 
 import argparse
@@ -37,13 +55,41 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--image_size", type=int, default=256)
 
+    p.add_argument("--ema_decay", type=float, default=0.9999)
+    p.add_argument("--ema_update_every", type=int, default=10)
+    p.add_argument("--save_every_n_epochs", type=int, default=5)
+    p.add_argument("--keep_last_n_checkpoints", type=int, default=3)
+
     p.add_argument("--no_amp", action="store_true")
     p.add_argument("--no_compile", action="store_true")
 
+    # Mode: full resume (restores optimizer/scheduler/epoch count)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--checkpoint", default=None)
 
-    return p.parse_args()
+    # Mode: weights-only init (fresh optimizer/scheduler/epoch count) —
+    # use when starting a new fine-tuning phase (e.g. new loss terms) from
+    # an existing checkpoint rather than a literal continuation.
+    p.add_argument(
+        "--init_weights_from",
+        default=None,
+        help=(
+            "Path to a checkpoint to load ONLY model+EMA weights from. "
+            "Starts a fresh optimizer/scheduler/epoch count (epoch 1). "
+            "Mutually exclusive with --resume/--checkpoint."
+        ),
+    )
+
+    args = p.parse_args()
+
+    if args.init_weights_from and (args.resume or args.checkpoint):
+        p.error(
+            "--init_weights_from cannot be combined with --resume/--checkpoint. "
+            "Use --init_weights_from for a fresh fine-tuning phase, or "
+            "--resume/--checkpoint to literally continue an interrupted run."
+        )
+
+    return args
 
 
 def main() -> None:
@@ -52,6 +98,7 @@ def main() -> None:
         format="%(asctime)s  %(levelname)-7s  %(message)s",
         datefmt="%H:%M:%S",
     )
+    log = logging.getLogger(__name__)
 
     args = parse_args()
 
@@ -68,16 +115,34 @@ def main() -> None:
         image_size=args.image_size,
         use_amp=not args.no_amp,
         compile_model=not args.no_compile,
+        ema_decay=args.ema_decay,
+        ema_update_every=args.ema_update_every,
+        save_every_n_epochs=args.save_every_n_epochs,
+        keep_last_n_checkpoints=args.keep_last_n_checkpoints,
         model=PUWDMConfig(),
     )
 
     trainer = PUWDMTrainer(cfg)
+
+    if args.init_weights_from:
+        log.info(
+            "Mode: WEIGHTS-ONLY INIT from %s — fresh optimizer/scheduler/epoch count",
+            args.init_weights_from,
+        )
+        trainer.load_weights_from(args.init_weights_from)
+        trainer.fit(resume_from=None)
+        return
 
     resume_ckpt = args.checkpoint
     if args.resume and resume_ckpt is None:
         # auto-detect latest epoch checkpoint
         ckpts = sorted(Path(args.checkpoint_dir).glob("epoch_*.pt"))
         resume_ckpt = str(ckpts[-1]) if ckpts else None
+
+    if resume_ckpt:
+        log.info("Mode: FULL RESUME from %s", resume_ckpt)
+    else:
+        log.info("Mode: FRESH RUN (random init)")
 
     trainer.fit(resume_from=resume_ckpt)
 
