@@ -48,6 +48,8 @@ checkpoints/
 *.hdf5
 *.safetensors
 
+checkpoints_phase2_hist/
+
 # Training logs & runs
 runs/
 logs/
@@ -131,6 +133,7 @@ htmlcov/
 .coverage
 coverage.xml
 train.pid
+*.pid
 
 results/
 results_epoch100/
