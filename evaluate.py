@@ -9,7 +9,9 @@ UIEB test split, and computes:
   • PSNR      (dB)         — structural fidelity
   • SSIM      [0-1]        — perceptual similarity
   • LPIPS     [0-1]        — deep perceptual distance (lower = better)
-  • UCIQE     [0-1]        — underwater image quality (no reference)
+  • UCIQE     (scalar)     — underwater image quality (no reference; this
+                             implementation's Lab-space formula is NOT
+                             normalized to [0-1] — typical values are ~10-40)
   • UIQM      (scalar)     — underwater image quality measure
 
 Side-by-side comparison grids (input | enhanced | GT) are saved to:
@@ -306,22 +308,17 @@ def evaluate_batch(
             eta=0.0,
             use_ema=False,  # EMA disabled — raw weights already loaded
             progress=False,
-        )  # (B, 3, H, W)  in ImageNet-normalized space — denormed below
+        )  # (B, 3, H, W) — already in [0, 1], same space as the dataset
 
-    # Denormalize from ImageNet normalization back to [0, 1].
-    # Training dataset uses imagenet_normalised=True:
-    #   mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]
-    # Model output is in that same normalized space — must denorm before
-    # computing metrics (PSNR/SSIM) and saving visuals.
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-
-    def denorm(t: torch.Tensor) -> torch.Tensor:
-        return (t * std + mean).clamp(0.0, 1.0)
-
-    enhanced_01 = denorm(enhanced_norm)
-    raw_01 = denorm(raw)
-    ref_01 = denorm(reference)
+    # NOTE: no denormalization here. `imagenet_normalised=True` in the dataset
+    # config does NOT actually apply normalization (verified: raw tensor
+    # min=0, max=1, no negatives) — all data is already [0, 1]. Applying an
+    # ImageNet mean/std denorm on top of already-[0,1] data was the exact
+    # bug that produced invalid inflated metrics (PSNR=30.72, SSIM=0.964)
+    # and washed-out visuals in an earlier evaluation pass. Clamp only.
+    enhanced_01 = enhanced_norm.clamp(0.0, 1.0)
+    raw_01 = raw.clamp(0.0, 1.0)
+    ref_01 = reference.clamp(0.0, 1.0)
 
     # Log min/max of first image in batch for debugging
     log.debug(
@@ -535,7 +532,7 @@ def main():
         f"  PSNR   (↑)  : {agg['psnr']:.4f} dB   ± {agg_std['psnr']:.4f}   [target >22]",
         f"  SSIM   (↑)  : {agg['ssim']:.4f}      ± {agg_std['ssim']:.4f}   [target >0.85]",
         f"  LPIPS  (↓)  : {agg['lpips']:.4f}      ± {agg_std['lpips']:.4f}",
-        f"  UCIQE  (↑)  : {agg['uciqe']:.4f}      ± {agg_std['uciqe']:.4f}   [target >0.6]",
+        f"  UCIQE  (↑)  : {agg['uciqe']:.4f}      ± {agg_std['uciqe']:.4f}   (no fixed target — compare vs. baseline run)",
         f"  UIQM   (↑)  : {agg['uiqm']:.4f}      ± {agg_std['uiqm']:.4f}",
         "═" * 55,
         "",
