@@ -50,6 +50,8 @@ checkpoints/
 
 checkpoints_phase2_hist/
 
+checkpoints_phase3_hist/
+
 # Training logs & runs
 runs/
 logs/

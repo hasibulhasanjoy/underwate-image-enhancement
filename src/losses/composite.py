@@ -71,12 +71,19 @@ class LossWeights:
 
     @classmethod
     def phase2(cls) -> "LossWeights":
-        """Phase 2: add light perceptual + histogram loss at low timesteps only."""
+        """
+        Phase 2: add light perceptual + histogram loss at low timesteps only.
+
+        histogram=0.15 (bumped from 0.1 after the first phase-2-hist run
+        showed clear gains: PSNR 15.86→18.74 dB, SSIM 0.745→0.830,
+        UCIQE 16.89→22.79, LPIPS 0.302→0.203. Modest increase, not a big
+        jump, since we haven't yet seen where this loss stops helping.
+        """
         return cls(
             diffusion=1.0,
             adversarial=0.0,
             perceptual=0.05,
-            histogram=0.1,
+            histogram=0.15,
             contrastive=0.0,
         )
 
