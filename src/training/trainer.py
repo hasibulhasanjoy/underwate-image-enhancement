@@ -1,5 +1,5 @@
 """
-src/training/trainer.py — fixed version.
+src/training/trainer.py — fixed version + LSUI combined-training support.
 
 Key changes from original
 ──────────────────────────
@@ -17,6 +17,30 @@ Key changes from original
    inconsistency between trainer.py and composite.py weight definitions.
 
 4. grad_clip reduced to 0.5 (from 1.0) for more stable phase-2 training.
+
+5. NEW — LSUI combined-training support (cfg.use_lsui / lsui_raw_dir /
+   lsui_ref_dir). When enabled, LSUI pairs are appended to the TRAIN split
+   only; UIEB val/test (the fixed 134-image thesis benchmark) are untouched.
+
+6. NEW — augmentation is now actually wired in. Previously ``_build_data``
+   passed no transform to PhysicsUIEBDataModule at all, so every run to
+   date (including all phase1/2/2-hist/3-hist checkpoints) trained on
+   RAW, UNAUGMENTED images despite configs/data_config.yaml defining a
+   full augmentation pipeline. cfg.augment=True (default) now builds real
+   flip/rotation/color-jitter transforms via src.data.transforms, loaded
+   from configs/data_config.yaml — but with the `normalize` block forced
+   to identity (mean=0, std=1) regardless of what the yaml says, because
+   the diffusion model (DDIM, clip_denoised=True) expects [0,1] data, not
+   ImageNet-normalised data. Set cfg.augment=False to reproduce the old
+   (unaugmented) behaviour exactly.
+
+7. NEW — dataset_cfg is now built EXPLICITLY with imagenet_normalised=False
+   rather than relying on PhysicsDatasetConfig's dataclass default. This
+   was a real bug: the old default (imagenet_normalised=True) caused
+   _denorm_for_physics() to be wrongly applied to already-[0,1] pixels,
+   corrupting the ambient/transmission/degradation conditioning priors in
+   every run to date. See src/data/physics_dataset.py module docstring
+   (BUG-3) for full detail.
 """
 
 from __future__ import annotations
@@ -35,7 +59,11 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.tensorboard import SummaryWriter
 
-from src.data.physics_dataset import PhysicsUIEBDataModule, PhysicsDataModuleConfig
+from src.data.physics_dataset import (
+    PhysicsUIEBDataModule,
+    PhysicsDataModuleConfig,
+    PhysicsDatasetConfig,
+)
 from src.losses.composite import CompositeLoss, LossWeights
 from src.models.p_uwdm import PUWDM, PUWDMConfig
 
@@ -71,6 +99,21 @@ class TrainerConfig:
     pin_memory: bool = True
     prefetch_factor: int = 2
     image_size: int = 256
+
+    # ── augmentation (NEW) ──────────────────────────────────────────────────
+    # If True (default), real flip/rotation/color-jitter augmentation is
+    # built from data_config_path — with normalize forced to identity so
+    # data stays in [0,1] for the diffusion model. If False, reproduces the
+    # old (unaugmented) behaviour of every prior training phase exactly.
+    augment: bool = True
+    data_config_path: str = "configs/data_config.yaml"
+
+    # ── LSUI combined-training (NEW) ────────────────────────────────────────
+    # When use_lsui=True, LSUI pairs are appended to the TRAIN split only.
+    # UIEB val/test (fixed 134-image thesis benchmark) are never touched.
+    use_lsui: bool = False
+    lsui_raw_dir: Optional[str] = None  # e.g. "dataset/LSUI/input"
+    lsui_ref_dir: Optional[str] = None  # e.g. "dataset/LSUI/GT"
 
     # ── diffusion ──────────────────────────────────────────────────────────
     num_train_timesteps: int = 1000
@@ -191,6 +234,54 @@ class PUWDMTrainer:
 
     def _build_data(self) -> None:
         cfg = self.cfg
+
+        # ── Augmentation transforms (NEW) ───────────────────────────────
+        transform_train = None
+        transform_val = None
+        if cfg.augment:
+            from src.utils.config import load_data_config
+            from src.data.transforms import get_train_transforms, get_val_transforms
+
+            data_cfg = load_data_config(
+                cfg.data_config_path,
+                overrides={
+                    "preprocessing": {
+                        "image_size": [cfg.image_size, cfg.image_size],
+                        # Identity normalize — the diffusion model expects
+                        # raw pixels in [0,1] (DDIM, clip_denoised=True),
+                        # NOT ImageNet-normalised data. Only the
+                        # augmentation ops themselves (flip/rotation/
+                        # color-jitter) are taken from the yaml.
+                        "normalize": {
+                            "mean": [0.0, 0.0, 0.0],
+                            "std": [1.0, 1.0, 1.0],
+                        },
+                    }
+                },
+            )
+            transform_train = get_train_transforms(data_cfg)
+            transform_val = get_val_transforms(data_cfg)
+            log.info(
+                "Augmentation ENABLED (flip/rotation/color-jitter from %s); "
+                "normalize forced to identity to preserve [0,1] range.",
+                cfg.data_config_path,
+            )
+        else:
+            log.info(
+                "Augmentation DISABLED — matching all prior training "
+                "phases exactly (raw, unaugmented images)."
+            )
+
+        # ── Physics-dataset config: EXPLICIT fix for the imagenet_normalised
+        # default bug (see physics_dataset.py module docstring, BUG-3). We
+        # never apply real ImageNet normalisation in this pipeline (identity
+        # normalize above, or no transform at all), so this must be False.
+        ds_cfg = PhysicsDatasetConfig(
+            load_size=(cfg.image_size, cfg.image_size),
+            physics_on_augmented=True,
+            imagenet_normalised=False,
+        )
+
         dm_cfg = PhysicsDataModuleConfig(
             raw_dir=str(Path(cfg.data_root) / "raw"),
             ref_dir=str(Path(cfg.data_root) / "reference"),
@@ -200,8 +291,14 @@ class PUWDMTrainer:
             pin_memory=cfg.pin_memory,
             prefetch_factor=cfg.prefetch_factor,
             load_size=(cfg.image_size, cfg.image_size),
+            dataset_cfg=ds_cfg,
+            use_lsui=cfg.use_lsui,
+            lsui_raw_dir=cfg.lsui_raw_dir,
+            lsui_ref_dir=cfg.lsui_ref_dir,
         )
-        self.dm = PhysicsUIEBDataModule(dm_cfg)
+        self.dm = PhysicsUIEBDataModule(
+            dm_cfg, transform_train=transform_train, transform_val=transform_val
+        )
         self.dm.setup()
         self.train_loader = self.dm.train_dataloader()
         self.val_loader = self.dm.val_dataloader()
@@ -455,11 +552,11 @@ class PUWDMTrainer:
         scheduler, epoch count, or best_val_loss.
 
         Use this (instead of fit(resume_from=...)) when starting a new
-        fine-tuning phase with a different loss composition (e.g. adding
-        histogram loss). A literal resume would also restore the old,
-        already-decayed cosine LR schedule, effectively training the new
-        epochs at ~eta_min. This gives the extension run its own fresh
-        warmup + cosine decay instead.
+        fine-tuning phase with a different loss composition or dataset
+        (e.g. the combined UIEB+LSUI phase1b re-exposure). A literal resume
+        would also restore the old, already-decayed cosine LR schedule,
+        effectively training the new epochs at ~eta_min. This gives the
+        extension run its own fresh warmup + cosine decay instead.
         """
         log.info(
             "Loading weights ONLY (fresh optimizer/scheduler/epoch count) from %s",

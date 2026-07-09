@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train.py — P-UWDM training entry point (fixed).
+train.py — P-UWDM training entry point (fixed + LSUI combined-training support).
 
 Three modes, all through this one script:
 
@@ -14,17 +14,30 @@ Three modes, all through this one script:
 
 3. Weights-only init (loads ONLY model + EMA weights from a checkpoint,
    then starts a FRESH optimizer/scheduler/epoch count — use this when
-   starting a new fine-tuning phase with a different loss composition,
-   e.g. adding histogram loss on top of an already-trained model, so the
+   starting a new fine-tuning phase with a different loss composition or
+   dataset, e.g. the combined UIEB+LSUI phase1b re-exposure, so the
    LR schedule gets a proper warmup + decay instead of inheriting an
    already-decayed one):
-       python train.py --init_weights_from checkpoints/best.pt \\
-           --checkpoint_dir checkpoints_phase2_hist \\
-           --log_dir runs/p_uwdm_phase2_hist \\
-           --total_epochs 120 --phase1_epochs 0
+       python train.py --init_weights_from checkpoints_phase3_hist/epoch_0150.pt \\
+           --checkpoint_dir checkpoints_phase1b_lsui \\
+           --log_dir runs/p_uwdm_phase1b_lsui \\
+           --total_epochs 120 --phase1_epochs 120 \\
+           --use_lsui --lsui_raw_dir dataset/LSUI/input --lsui_ref_dir dataset/LSUI/GT
 
 Examples for the shared-GPU / small-VRAM case:
     python train.py --batch_size 8             # smaller batch (shared GPU)
+
+NEW — LSUI combined training:
+    --use_lsui appends all LSUI (input, GT) pairs to the TRAIN split ONLY.
+    The UIEB val/test splits (fixed 134-image thesis benchmark) are never
+    touched — evaluate.py still reports against the exact same benchmark
+    as every prior phase.
+
+NEW — augmentation:
+    Real flip/rotation/color-jitter augmentation is now wired in by default
+    (cfg.augment=True), built from --data_config (default
+    configs/data_config.yaml). Pass --no_augment to reproduce the old
+    (unaugmented) behaviour of every prior training phase exactly.
 """
 
 import argparse
@@ -63,13 +76,41 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_amp", action="store_true")
     p.add_argument("--no_compile", action="store_true")
 
+    # Augmentation (NEW)
+    p.add_argument(
+        "--data_config",
+        default="configs/data_config.yaml",
+        help="Path to data_config.yaml, used only for augmentation settings "
+        "(flip/rotation/color-jitter). normalize is always forced to "
+        "identity regardless of what the yaml specifies, to keep data in "
+        "[0,1] for the diffusion model.",
+    )
+    p.add_argument(
+        "--no_augment",
+        action="store_true",
+        help="Disable augmentation entirely, reproducing the exact "
+        "(unaugmented) behaviour of every prior training phase.",
+    )
+
+    # LSUI combined training (NEW)
+    p.add_argument(
+        "--use_lsui",
+        action="store_true",
+        help="Append all LSUI (input, GT) pairs to the TRAIN split only. "
+        "UIEB val/test splits (fixed 134-image thesis benchmark) are "
+        "never touched.",
+    )
+    p.add_argument("--lsui_raw_dir", default="dataset/LSUI/input")
+    p.add_argument("--lsui_ref_dir", default="dataset/LSUI/GT")
+
     # Mode: full resume (restores optimizer/scheduler/epoch count)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--checkpoint", default=None)
 
     # Mode: weights-only init (fresh optimizer/scheduler/epoch count) —
-    # use when starting a new fine-tuning phase (e.g. new loss terms) from
-    # an existing checkpoint rather than a literal continuation.
+    # use when starting a new fine-tuning phase (e.g. new loss terms, or a
+    # new dataset like combined UIEB+LSUI) from an existing checkpoint
+    # rather than a literal continuation.
     p.add_argument(
         "--init_weights_from",
         default=None,
@@ -119,6 +160,11 @@ def main() -> None:
         ema_update_every=args.ema_update_every,
         save_every_n_epochs=args.save_every_n_epochs,
         keep_last_n_checkpoints=args.keep_last_n_checkpoints,
+        augment=not args.no_augment,
+        data_config_path=args.data_config,
+        use_lsui=args.use_lsui,
+        lsui_raw_dir=args.lsui_raw_dir,
+        lsui_ref_dir=args.lsui_ref_dir,
         model=PUWDMConfig(),
     )
 

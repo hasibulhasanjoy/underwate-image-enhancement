@@ -1,7 +1,7 @@
 """
 src/data/physics_dataset.py
 ────────────────────────────────────────────────────────────────────────────
-Physics-aware UIEB dataset with integrated prior estimation.
+Physics-aware UIEB(+LSUI) dataset with integrated prior estimation.
 
 Each sample returned by __getitem__ contains:
 
@@ -21,16 +21,15 @@ At model input time:
   • Dual-stream degradation estimator receives `degradation` as stream-1
     input; its stream-2 CNN encoder processes raw image patches.
 
-This module computes all three priors on-the-fly in DataLoader workers
-(no offline pre-computation needed for UIEB's 900 images; each sample
-takes ~10ms on CPU workers).  For large datasets (LSUI 4k, EUVP 12k)
-consider offline caching via `PhysicsCacheBuilder`.
-
-Performance on RTX 4090 setup
-──────────────────────────────
-With 16 DataLoader workers and pin_memory=True, physics estimation
-adds ~0 wall-clock overhead because workers are CPU-bound and run in
-parallel while the GPU processes the previous batch.
+This module computes all three priors on-the-fly in DataLoader workers.
+On UIEB (~900 images) each sample takes ~10ms on CPU workers and this
+overhead is fully hidden behind GPU compute with 16 workers. For LSUI-scale
+data (~4.3k pairs) the same per-sample cost applies — see
+scripts/benchmark_physics_throughput.py to confirm wall-clock behaviour on
+your actual hardware before committing to a long run. If it turns out to
+be a bottleneck, an offline PhysicsCacheBuilder (precompute once to disk)
+is the natural next step — not yet implemented, since live computation is
+expected to remain hidden behind GPU compute.
 
 Bug fixes applied
 ─────────────────
@@ -44,13 +43,27 @@ BUG-1 (PhysicsUIEBDataModule.setup — manifest key mismatch):
 
 BUG-2 (PhysicsUIEBDataset.__getitem__ — physics estimator input range):
     Physics estimators (AmbientLightEstimator, TransmissionEstimator,
-    DegradationEstimator) expect pixel values in [0, 1].  When
-    ``physics_on_augmented=True`` the tensor passed in is the transform
-    output, which may be ImageNet-normalised (range ≈ −2.1 … +2.6).
-    Fixed: introduce a ``_denorm_for_physics()`` helper that reverses
-    ImageNet normalisation before calling the estimators.  The model
-    still receives the fully-normalised ``raw_t`` / ``ref_t`` tensors —
-    only the physics branch sees the [0, 1] version.
+    DegradationEstimator) expect pixel values in [0, 1]. ``_denorm_for_physics()``
+    reverses ImageNet normalisation before calling the estimators, gated by
+    ``cfg.imagenet_normalised``.
+
+BUG-3 (PhysicsDatasetConfig.imagenet_normalised default — FIXED THIS ROUND):
+    The dataclass default was ``imagenet_normalised=True``, but the actual
+    training pipeline (trainer.py._build_data) has NEVER applied real
+    ImageNet normalisation — either no transform was passed at all (plain
+    [0,1] tensors), or (as of this round) an explicit identity-normalize
+    augmentation pipeline is used (flip/rotation/color-jitter, but
+    mean=[0,0,0]/std=[1,1,1] so pixel values stay in [0,1] — required for
+    compatibility with the diffusion model's [0,1]/clip_denoised=True
+    assumptions). With the old default, ``_denorm_for_physics()`` was being
+    called on already-[0,1] pixels, compressing/shifting them into roughly
+    [0.485,0.714] (R) / [0.456,0.68] (G) / [0.406,0.631] (B) before the
+    physics estimators ever saw them — corrupting every ambient/transmission
+    /degradation prior used for conditioning in every run to date (phase1
+    through phase3_hist).
+    Fixed: default changed to ``imagenet_normalised=False``. Callers that
+    genuinely do apply real ImageNet normalisation in their transform must
+    now explicitly pass ``imagenet_normalised=True``.
 """
 
 from __future__ import annotations
@@ -89,12 +102,9 @@ def _denorm_for_physics(t: Tensor) -> Tensor:
     """
     Reverse ImageNet normalisation so physics estimators receive [0, 1] input.
 
-    If the tensor is already in [0, 1] (i.e. no normalisation was applied by
-    the transform), the result is still valid because:
-        t_01 * std + mean  stays ≈ in [0, 1] for typical underwater images.
-
-    To guarantee correctness the caller should pass ``physics_on_augmented``
-    consistently with the transform used (see PhysicsDatasetConfig).
+    Only call this when the tensor passed in was ACTUALLY ImageNet-normalised
+    by the transform (cfg.imagenet_normalised=True). Calling it on plain
+    [0,1] data silently corrupts the physics priors — see BUG-3 above.
 
     Parameters
     ----------
@@ -185,10 +195,16 @@ class PhysicsDatasetConfig:
     # Recommendation: True — priors should reflect the augmented spatial layout.
     physics_on_augmented: bool = True
 
-    # Whether the transform applies ImageNet normalisation.
-    # Set to False if the transform keeps pixel values in [0, 1].
-    # When True, _denorm_for_physics() is called before physics estimation.
-    imagenet_normalised: bool = True
+    # Whether the transform applies REAL ImageNet normalisation (mean/std
+    # that actually shift data out of [0,1]). Set True ONLY if your
+    # transform truly normalises with non-identity mean/std.
+    #
+    # FIXED THIS ROUND (BUG-3): default changed from True → False. The
+    # training pipeline has never applied real ImageNet normalisation (see
+    # module docstring). The old True default caused _denorm_for_physics()
+    # to be wrongly applied to already-[0,1] pixels, corrupting every
+    # physics prior computed in phases 1 through 3_hist.
+    imagenet_normalised: bool = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -198,7 +214,10 @@ class PhysicsDatasetConfig:
 
 class PhysicsUIEBDataset(Dataset):
     """
-    Physics-aware UIEB dataset.
+    Physics-aware paired-image dataset. Despite the name (kept for backward
+    compatibility), this class is dataset-agnostic — it just takes lists of
+    (raw_path, ref_path) pairs, so the same class serves UIEB, LSUI, or a
+    combined list of both (see PhysicsUIEBDataModule.setup below).
 
     Loads paired (raw, reference) images, applies optional transforms,
     then computes ambient light, transmission map, and degradation features
@@ -213,8 +232,9 @@ class PhysicsUIEBDataset(Dataset):
     transform : callable, optional
         PairedTransform or similar that takes (raw_pil, ref_pil) and
         returns (raw_tensor, ref_tensor) in CHW float32.
-        If ImageNet normalisation is included, set
-        ``cfg.imagenet_normalised = True`` (the default).
+        If the transform applies REAL ImageNet normalisation, set
+        ``cfg.imagenet_normalised = True``. Default is False (identity
+        normalize / plain [0,1] — see BUG-3 in module docstring).
     cfg : PhysicsDatasetConfig
 
     Notes
@@ -223,12 +243,9 @@ class PhysicsUIEBDataset(Dataset):
     property.  This avoids pickling overhead (estimators hold no state
     that changes per-sample).
 
-    BUG-2 FIX — input range contract
-    ─────────────────────────────────
-    Physics estimators expect [0, 1] input.  When ``physics_on_augmented``
-    is True AND ``imagenet_normalised`` is True, ``_denorm_for_physics()``
-    is called on ``raw_t`` before passing it to the estimators.  The model
-    still receives the original (normalised) ``raw_t``.
+    Images of any native resolution are accepted — they are resized to
+    ``cfg.load_size`` with BICUBIC interpolation before any transform is
+    applied, so variable-resolution sources (e.g. LSUI) work unmodified.
     """
 
     def __init__(
@@ -273,6 +290,9 @@ class PhysicsUIEBDataset(Dataset):
         ref_pil = Image.open(ref_path).convert("RGB")
 
         # ── Resize (before transform to ensure consistent spatial dims) ──
+        # Works for any native resolution — LSUI images (variable, e.g.
+        # 640x320, 720x405, 1280x1024) are resized identically to UIEB's
+        # already-256x256 images.
         H, W = self.cfg.load_size
         raw_pil = raw_pil.resize((W, H), Image.BICUBIC)
         ref_pil = ref_pil.resize((W, H), Image.BICUBIC)
@@ -293,8 +313,10 @@ class PhysicsUIEBDataset(Dataset):
         else:
             physics_src = _pil_to_tensor(raw_pil)  # always [0, 1]
 
-        # BUG-2 FIX: denormalise if the tensor is ImageNet-normalised so
-        # the physics estimators always receive values in [0, 1].
+        # Denormalise ONLY if the transform genuinely applied real ImageNet
+        # normalisation (cfg.imagenet_normalised=True). Default is False —
+        # see BUG-3 in module docstring for why this must not be applied
+        # to already-[0,1] data.
         if self.cfg.physics_on_augmented and self.cfg.imagenet_normalised:
             physics_src = _denorm_for_physics(physics_src)
 
@@ -328,6 +350,55 @@ class PhysicsUIEBDataset(Dataset):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# LSUI pair discovery (NEW — for the combined UIEB+LSUI training phase)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _discover_lsui_pairs(
+    lsui_raw_dir: Path,
+    lsui_ref_dir: Path,
+    exts: set,
+) -> Tuple[List[Path], List[Path]]:
+    """
+    Discover paired (input, GT) images in an LSUI-style directory layout,
+    where both directories contain files with IDENTICAL filenames
+    (e.g. "0.jpg" in both input/ and GT/).
+
+    Unlike UIEB's manifest+sorted-index approach, LSUI has no split
+    manifest — pairing is done by filename intersection, sorted for
+    determinism. Any filename present in only one of the two directories
+    is dropped and logged as a warning (defensive; the known LSUI dataset
+    has been verified to match 1:1, but this guards against a partial
+    download or future dataset variant).
+
+    Returns
+    -------
+    (raw_paths, ref_paths) — same length, same order, sorted by filename.
+    """
+    raw_files = {p.name: p for p in lsui_raw_dir.iterdir() if p.suffix.lower() in exts}
+    ref_files = {p.name: p for p in lsui_ref_dir.iterdir() if p.suffix.lower() in exts}
+
+    common_names = sorted(set(raw_files) & set(ref_files))
+    missing_ref = set(raw_files) - set(ref_files)
+    missing_raw = set(ref_files) - set(raw_files)
+
+    if missing_ref or missing_raw:
+        logger.warning(
+            "LSUI pairing mismatch: %d input files with no GT match, "
+            "%d GT files with no input match. These are DROPPED. "
+            "First few missing (input-only): %s | (GT-only): %s",
+            len(missing_ref),
+            len(missing_raw),
+            sorted(missing_ref)[:5],
+            sorted(missing_raw)[:5],
+        )
+
+    raw_paths = [raw_files[name] for name in common_names]
+    ref_paths = [ref_files[name] for name in common_names]
+    return raw_paths, ref_paths
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # DataModule (Lightning-style, manually managed)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -336,13 +407,21 @@ class PhysicsUIEBDataset(Dataset):
 class PhysicsDataModuleConfig:
     """Configuration for PhysicsUIEBDataModule."""
 
-    # Dataset paths
+    # Dataset paths (UIEB — the fixed thesis benchmark)
     raw_dir: str = "dataset/UIEB/raw"
     ref_dir: str = "dataset/UIEB/reference"
 
     # Split manifest JSON produced by src.data.splitter
     # Must contain keys: train_indices, val_indices, test_indices, n_samples
     split_manifest: str = "dataset/UIEB/split_manifest.json"
+
+    # ── LSUI augmentation dataset (NEW, optional) ──────────────────────
+    # When enabled, LSUI pairs are appended to the TRAIN split ONLY.
+    # UIEB val/test splits (the fixed 134-image thesis benchmark) are
+    # NEVER touched by this — LSUI never enters val/test evaluation.
+    use_lsui: bool = False
+    lsui_raw_dir: Optional[str] = None  # e.g. "dataset/LSUI/input"
+    lsui_ref_dir: Optional[str] = None  # e.g. "dataset/LSUI/GT"
 
     # DataLoader settings — tuned for RTX 4090 / Ryzen 9 7950X
     batch_size: int = 32
@@ -372,14 +451,21 @@ class PhysicsUIEBDataModule:
     DataModule that exposes train/val/test DataLoaders with full physics
     priors for P-UWDM conditioning.
 
+    LSUI integration (NEW)
+    ───────────────────────
+    When ``cfg.use_lsui=True``, ``setup()`` additionally discovers all
+    (input, GT) pairs under ``cfg.lsui_raw_dir`` / ``cfg.lsui_ref_dir``
+    (paired by identical filename — see ``_discover_lsui_pairs``) and
+    appends them to the TRAIN path lists only, after the UIEB train
+    subset. Val and test datasets remain pure UIEB, built exactly as
+    before from the split manifest — this preserves the fixed 134-image
+    thesis benchmark untouched by the new data.
+
     BUG-1 FIX — manifest key mismatch
     ───────────────────────────────────
     The splitter (src.data.splitter) saves integer index lists under the
-    keys ``train_indices``, ``val_indices``, and ``test_indices``.  The
-    old code read ``manifest["train"]`` / ``"val"`` / ``"test"]``, which
-    do not exist in the manifest, causing a ``KeyError``.
-
-    The fixed ``setup()`` method:
+    keys ``train_indices``, ``val_indices``, and ``test_indices``. The
+    fixed ``setup()`` method:
       1. Reads ``manifest["train_indices"]`` etc. (integer lists).
       2. Builds a sorted list of all raw/ref image paths from the
          directories (same ordering the splitter saw).
@@ -417,13 +503,8 @@ class PhysicsUIEBDataModule:
 
     def setup(self) -> None:
         """
-        Load split manifest and initialise datasets.
-
-        BUG-1 FIX: reads ``train_indices`` / ``val_indices`` /
-        ``test_indices`` from the manifest (integer index lists produced
-        by src.data.splitter), then selects the corresponding paths from
-        a sorted directory listing — matching exactly the ordering the
-        splitter used when it created the manifest.
+        Load split manifest and initialise datasets. If ``cfg.use_lsui``
+        is set, LSUI pairs are appended to the TRAIN dataset only.
         """
         import json
 
@@ -452,7 +533,7 @@ class PhysicsUIEBDataModule:
         test_indices: List[int] = manifest["test_indices"]
         n_manifest: int = manifest["n_samples"]
 
-        # ── Discover all paths (must match the ordering used at split time) ──
+        # ── Discover all UIEB paths (must match ordering used at split time) ──
         raw_dir = Path(self.cfg.raw_dir)
         ref_dir = Path(self.cfg.ref_dir)
 
@@ -482,6 +563,30 @@ class PhysicsUIEBDataModule:
         val_ref = _select(val_indices, all_ref_paths)
         test_raw = _select(test_indices, all_raw_paths)
         test_ref = _select(test_indices, all_ref_paths)
+
+        n_uieb_train = len(train_raw)
+
+        # ── NEW: append LSUI pairs to TRAIN only ────────────────────
+        if self.cfg.use_lsui:
+            if not self.cfg.lsui_raw_dir or not self.cfg.lsui_ref_dir:
+                raise ValueError(
+                    "cfg.use_lsui=True requires both lsui_raw_dir and "
+                    "lsui_ref_dir to be set."
+                )
+            lsui_raw, lsui_ref = _discover_lsui_pairs(
+                Path(self.cfg.lsui_raw_dir), Path(self.cfg.lsui_ref_dir), exts
+            )
+            train_raw = train_raw + lsui_raw
+            train_ref = train_ref + lsui_ref
+            logger.info(
+                "LSUI enabled: +%d paired images appended to TRAIN only "
+                "(UIEB train=%d -> combined train=%d; UIEB val=%d / test=%d unaffected)",
+                len(lsui_raw),
+                n_uieb_train,
+                len(train_raw),
+                len(val_indices),
+                len(test_indices),
+            )
 
         # ── Build dataset config ───────────────────────────────────
         ds_cfg = self.cfg.dataset_cfg or PhysicsDatasetConfig(
