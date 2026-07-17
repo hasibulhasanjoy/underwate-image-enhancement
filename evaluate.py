@@ -45,7 +45,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch import Tensor
 from torchvision import transforms
-from torchvision.utils import make_grid, save_image
+from torchvision.utils import make_grid
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -407,21 +407,99 @@ def evaluate_batch(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def save_visual_grid(
+def save_annotated_grid(
     raw_01: Tensor,
     enh_01: Tensor,
     ref_01: Tensor,
+    metrics: Dict[str, float],
     out_path: Path,
     idx: int,
-):
-    """Save a side-by-side [Input | Enhanced | GT] grid."""
+    psnr_target: float = 22.0,
+    ssim_target: float = 0.85,
+) -> Path:
+    """
+    Save a [Input | Enhanced | Reference] grid with a metrics panel burned
+    in underneath — PSNR/SSIM/LPIPS/UCIQE/UIQM plus a MEETS/BELOW TARGET
+    tag (vs. the thesis targets PSNR>22 dB, SSIM>0.85) — so image quality
+    can be judged directly from the file, without cross-referencing the CSV.
+
+    Returns the path the file was saved to (filename encodes idx + SSIM so
+    files sort meaningfully by name as well as via ranking.txt).
+    """
+    from PIL import ImageDraw, ImageFont
+
     grid = make_grid(
         torch.stack([raw_01, enh_01, ref_01], dim=0),
         nrow=3,
         padding=4,
         pad_value=1.0,
     )
-    save_image(grid, out_path / f"sample_{idx:04d}.png")
+    grid_np = (grid.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype("uint8")
+    grid_img = Image.fromarray(grid_np)
+
+    panel_h = 92
+    canvas = Image.new("RGB", (grid_img.width, grid_img.height + panel_h), "white")
+    canvas.paste(grid_img, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    try:
+        font = ImageFont.load_default(size=16)
+        font_small = ImageFont.load_default(size=13)
+    except TypeError:
+        # Older Pillow without the `size` kwarg on load_default()
+        font = font_small = ImageFont.load_default()
+
+    meets_target = metrics["psnr"] >= psnr_target and metrics["ssim"] >= ssim_target
+    tag = "MEETS TARGET" if meets_target else "BELOW TARGET"
+    tag_color = (0, 130, 0) if meets_target else (180, 0, 0)
+
+    y = grid_img.height + 6
+    draw.text((10, y), f"idx={idx:04d}   {tag}", fill=tag_color, font=font)
+    draw.text(
+        (10, y + 22),
+        f"PSNR={metrics['psnr']:.2f} dB   SSIM={metrics['ssim']:.4f}   "
+        f"LPIPS={metrics['lpips']:.4f}",
+        fill="black",
+        font=font_small,
+    )
+    draw.text(
+        (10, y + 42),
+        f"UCIQE={metrics['uciqe']:.2f}   UIQM={metrics['uiqm']:.2f}",
+        fill="black",
+        font=font_small,
+    )
+    draw.text(
+        (10, y + 64),
+        "Input | Enhanced | Reference",
+        fill=(90, 90, 90),
+        font=font_small,
+    )
+
+    fname = f"idx{idx:04d}_ssim{metrics['ssim']:.3f}_psnr{metrics['psnr']:.1f}.png"
+    save_path = out_path / fname
+    canvas.save(save_path)
+    return save_path
+
+
+def write_ranking_file(all_results: List[Dict], out_path: Path) -> None:
+    """
+    Write ranking.txt sorted worst-to-best by SSIM, so poor performers can
+    be found immediately without opening metrics.csv or scanning all images.
+    """
+    ranked = sorted(all_results, key=lambda r: r["ssim"])
+    lines = [
+        "Ranked WORST -> BEST by SSIM",
+        "=" * 70,
+        f"{'idx':>5}  {'ssim':>7}  {'psnr':>7}  {'lpips':>7}  {'uciqe':>7}  {'uiqm':>7}",
+        "-" * 70,
+    ]
+    for r in ranked:
+        lines.append(
+            f"{r['idx']:>5}  {r['ssim']:>7.4f}  {r['psnr']:>7.2f}  "
+            f"{r['lpips']:>7.4f}  {r['uciqe']:>7.2f}  {r['uiqm']:>7.2f}"
+        )
+    (out_path / "ranking.txt").write_text("\n".join(lines))
+    log.info("Ranking (worst->best by SSIM) → %s", out_path / "ranking.txt")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -449,8 +527,22 @@ def parse_args():
     p.add_argument(
         "--max_visuals",
         type=int,
-        default=30,
-        help="Max visual grids to save (set 0 for all)",
+        default=0,
+        help="Max annotated visual grids to save, 0 = save all test images "
+        "(default: all — was previously capped at 30). Use a small number "
+        "for a fast preview run.",
+    )
+    p.add_argument(
+        "--psnr_target",
+        type=float,
+        default=22.0,
+        help="PSNR threshold for the MEETS/BELOW TARGET tag on each image.",
+    )
+    p.add_argument(
+        "--ssim_target",
+        type=float,
+        default=0.85,
+        help="SSIM threshold for the MEETS/BELOW TARGET tag on each image.",
     )
     p.add_argument(
         "--out_dir",
@@ -482,7 +574,7 @@ def main():
         )
     else:
         out_dir = Path(args.out_dir)
-    visual_dir = out_dir / "visuals"
+    visual_dir = out_dir / "visuals_annotated"
     out_dir.mkdir(parents=True, exist_ok=True)
     if args.save_visuals:
         visual_dir.mkdir(parents=True, exist_ok=True)
@@ -534,21 +626,24 @@ def main():
 
         for img_result in per_img:
             global_idx = len(all_results)
+            metrics = {k: v for k, v in img_result.items() if not k.startswith("_")}
+            metrics["idx"] = global_idx
 
             if args.save_visuals and (
                 args.max_visuals == 0 or visual_count < args.max_visuals
             ):
-                save_visual_grid(
+                save_annotated_grid(
                     img_result["_raw_01"],
                     img_result["_enh_01"],
                     img_result["_ref_01"],
-                    visual_dir,
-                    global_idx,
+                    metrics=metrics,
+                    out_path=visual_dir,
+                    idx=global_idx,
+                    psnr_target=args.psnr_target,
+                    ssim_target=args.ssim_target,
                 )
                 visual_count += 1
 
-            metrics = {k: v for k, v in img_result.items() if not k.startswith("_")}
-            metrics["idx"] = global_idx
             all_results.append(metrics)
 
     elapsed = time.time() - t0
@@ -607,7 +702,13 @@ def main():
     log.info("Aggregate JSON → %s", json_path)
 
     if args.save_visuals:
-        log.info("Visual grids (%d) → %s", visual_count, visual_dir)
+        write_ranking_file(all_results, visual_dir)
+        log.info(
+            "Annotated visual grids (%d/%d) → %s",
+            visual_count,
+            len(all_results),
+            visual_dir,
+        )
 
     return agg
 
