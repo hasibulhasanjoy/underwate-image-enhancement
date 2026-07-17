@@ -24,7 +24,7 @@ A CSV summary and per-image table are saved to:
 Usage:
     python evaluate.py
     python evaluate.py --checkpoint checkpoints/best.pt --num_steps 50
-    python evaluate.py --checkpoint checkpoints/epoch_0100.pt --save_visuals
+    python evaluate.py --checkpoint checkpoints/epoch_0100.pt --no_save_visuals
 """
 
 from __future__ import annotations
@@ -253,8 +253,31 @@ def load_model(checkpoint_path: str, device: torch.device):
 def build_test_loader(
     data_root: str, image_size: int, batch_size: int, num_workers: int
 ):
-    """Return a DataLoader over the UIEB test split."""
-    from src.data.physics_dataset import PhysicsUIEBDataModule, PhysicsDataModuleConfig
+    """Return a DataLoader over the UIEB test split.
+
+    NOTE: this file has a documented history of the ImageNet-denorm bug
+    silently reappearing on fresh uploads (see project notes). To make this
+    file self-defending against that regression, `imagenet_normalised` is
+    pinned EXPLICITLY to False here rather than relying on
+    PhysicsDatasetConfig's dataclass default — the same explicit pattern
+    used in src/training/trainer.py._build_data(). This pipeline never
+    applies real ImageNet normalisation (identity normalize during training,
+    no transform at all here during eval — both stay in [0,1]), so this
+    must always be False. Do not remove this explicit override even if the
+    dataclass default looks correct at the time — that's exactly the
+    assumption that broke before.
+    """
+    from src.data.physics_dataset import (
+        PhysicsUIEBDataModule,
+        PhysicsDataModuleConfig,
+        PhysicsDatasetConfig,
+    )
+
+    ds_cfg = PhysicsDatasetConfig(
+        load_size=(image_size, image_size),
+        physics_on_augmented=True,
+        imagenet_normalised=False,  # EXPLICIT — see docstring above
+    )
 
     cfg = PhysicsDataModuleConfig(
         raw_dir=str(Path(data_root) / "raw"),
@@ -264,6 +287,8 @@ def build_test_loader(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=True,
+        dataset_cfg=ds_cfg,
+        use_lsui=False,  # EXPLICIT — test split must stay pure UIEB, always
     )
     dm = PhysicsUIEBDataModule(cfg)
     dm.setup()
@@ -415,10 +440,11 @@ def parse_args():
         "--num_steps", type=int, default=50, help="DDIM sampling steps (default 50)"
     )
     p.add_argument(
-        "--save_visuals",
-        action="store_true",
+        "--no_save_visuals",
+        dest="save_visuals",
+        action="store_false",
         default=True,
-        help="Save side-by-side comparison images",
+        help="Skip saving side-by-side comparison images (saved by default).",
     )
     p.add_argument(
         "--max_visuals",
@@ -426,7 +452,14 @@ def parse_args():
         default=30,
         help="Max visual grids to save (set 0 for all)",
     )
-    p.add_argument("--out_dir", default="results")
+    p.add_argument(
+        "--out_dir",
+        default=None,
+        help="Output directory for results. If not set, defaults to "
+        "'results_<checkpoint_dir>_<checkpoint_stem>' so evaluating multiple "
+        "checkpoints (e.g. best.pt vs epoch_0300.pt) never silently "
+        "overwrites a previous run's metrics/visuals.",
+    )
     return p.parse_args()
 
 
@@ -437,7 +470,18 @@ def main():
     log.info("Device: %s", device)
 
     # ── Output directories ────────────────────────────────────────────────
-    out_dir = Path(args.out_dir)
+    if args.out_dir is None:
+        ckpt_path = Path(args.checkpoint)
+        # e.g. checkpoints_v2_full_lsui/epoch_0300.pt -> results_checkpoints_v2_full_lsui_epoch_0300
+        auto_name = f"results_{ckpt_path.parent.name}_{ckpt_path.stem}"
+        out_dir = Path(auto_name)
+        log.info(
+            "--out_dir not set; auto-naming from checkpoint -> %s "
+            "(pass --out_dir explicitly to override)",
+            out_dir,
+        )
+    else:
+        out_dir = Path(args.out_dir)
     visual_dir = out_dir / "visuals"
     out_dir.mkdir(parents=True, exist_ok=True)
     if args.save_visuals:
