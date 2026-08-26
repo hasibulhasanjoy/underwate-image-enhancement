@@ -139,4 +139,5 @@ train.pid
 
 results/
 results_epoch100/
+result*/
 test.py
