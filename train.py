@@ -64,6 +64,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr_generator", type=float, default=2e-4)
     p.add_argument("--lr_discriminator", type=float, default=1e-4)
 
+    # Phase-2 LR schedule (NEW — fixes perceptual/histogram loss stalling
+    # flat instead of decreasing; see trainer.py TrainerConfig docstring)
+    p.add_argument(
+        "--lr_phase2",
+        type=float,
+        default=5e-5,
+        help="Fresh starting LR for phase 2 (diffusion+perceptual+histogram), "
+        "instead of inheriting the near-exhausted tail of phase 1's cosine "
+        "schedule. Decays via its own cosine schedule to the same eta_min "
+        "over the remaining epochs.",
+    )
+    p.add_argument("--phase2_warmup_epochs", type=int, default=5)
+    p.add_argument(
+        "--no_reset_optimizer_phase2",
+        action="store_true",
+        help="Keep Adam's moment estimates from phase 1 when entering phase "
+        "2, instead of resetting them (default: reset, since they were "
+        "built up under a loss composition that didn't include perceptual/"
+        "histogram terms).",
+    )
+
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--image_size", type=int, default=256)
@@ -151,6 +172,9 @@ def main() -> None:
         phase1_epochs=args.phase1_epochs,
         lr_generator=args.lr_generator,
         lr_discriminator=args.lr_discriminator,
+        lr_phase2=args.lr_phase2,
+        phase2_warmup_epochs=args.phase2_warmup_epochs,
+        reset_optimizer_on_phase2=not args.no_reset_optimizer_phase2,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         image_size=args.image_size,

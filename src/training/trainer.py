@@ -49,6 +49,7 @@ import logging
 import math
 import os
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -92,6 +93,20 @@ class TrainerConfig:
     weight_decay: float = 1e-2
     betas: tuple = (0.9, 0.999)
     grad_clip: float = 0.5  # FIXED: reduced from 1.0
+
+    # ── phase-2 LR schedule (NEW — fixes perceptual/histogram stall) ────────
+    # Previously sched_g was a SINGLE cosine schedule spanning the whole run
+    # (total_epochs), so by the time phase 2 turned on new loss terms
+    # (perceptual/histogram), LR had already decayed ~80%+ toward eta_min —
+    # leaving almost no room to actually learn the new loss composition.
+    # Phase 2 now gets its OWN warmup + cosine schedule over just the
+    # remaining epochs, starting from lr_phase2 (not wherever the phase-1
+    # cosine happened to leave off). Adam's moment estimates (built up over
+    # 240 epochs of pure diffusion loss) are also reset by default, since
+    # they're stale for gradients from loss terms that didn't exist before.
+    lr_phase2: float = 5e-5
+    phase2_warmup_epochs: int = 5
+    reset_optimizer_on_phase2: bool = True
 
     # ── data ───────────────────────────────────────────────────────────────
     batch_size: int = 16
@@ -338,7 +353,13 @@ class PUWDMTrainer:
             weight_decay=cfg.weight_decay,
         )
 
+        # NOTE: this schedule covers PHASE 1 ONLY (T_max=phase1_epochs), not
+        # the whole run. Phase 2 gets its own fresh warmup+cosine schedule
+        # built in _enter_phase2() — see TrainerConfig.lr_phase2 docstring
+        # for why: a single run-long cosine left phase 2 with almost no LR
+        # budget to learn its newly-introduced loss terms.
         warmup_steps = 5
+        phase1_t_max = max(cfg.phase1_epochs - warmup_steps, 1)
         self.sched_g = SequentialLR(
             self.opt_g,
             schedulers=[
@@ -348,9 +369,7 @@ class PUWDMTrainer:
                     end_factor=1.0,
                     total_iters=warmup_steps,
                 ),
-                CosineAnnealingLR(
-                    self.opt_g, T_max=cfg.total_epochs - warmup_steps, eta_min=1e-6
-                ),
+                CosineAnnealingLR(self.opt_g, T_max=phase1_t_max, eta_min=1e-6),
             ],
             milestones=[warmup_steps],
         )
@@ -374,15 +393,56 @@ class PUWDMTrainer:
         _freeze(self.criterion.discriminator)
 
     def _enter_phase2(self) -> None:
+        cfg = self.cfg
         log.info("═" * 60)
         log.info(
             "PHASE 2  (epochs %d–%d): diffusion + perceptual + histogram (t<200 only)",
-            self.cfg.phase1_epochs + 1,
-            self.cfg.total_epochs,
+            cfg.phase1_epochs + 1,
+            cfg.total_epochs,
         )
         log.info("═" * 60)
         self.criterion.set_phase(2)
         # Discriminator stays frozen — no adversarial training
+
+        # ── Fresh LR schedule + optimizer state for phase 2 ─────────────
+        # If this is a plain resume INTO an already-running phase 2, the
+        # subsequent _load_checkpoint_state() call in fit() will immediately
+        # overwrite everything set here with the exact saved state — so it's
+        # safe to always rebuild unconditionally. This block only actually
+        # changes behavior at the genuine phase-1 → phase-2 transition.
+        if cfg.reset_optimizer_on_phase2:
+            self.opt_g.state = defaultdict(dict)
+            log.info("  Reset opt_g Adam moment estimates for phase 2.")
+        for group in self.opt_g.param_groups:
+            group["lr"] = cfg.lr_phase2
+
+        remaining = max(cfg.total_epochs - cfg.phase1_epochs, 1)
+        warmup = min(cfg.phase2_warmup_epochs, max(remaining - 1, 0))
+        if warmup > 0:
+            self.sched_g = SequentialLR(
+                self.opt_g,
+                schedulers=[
+                    LinearLR(
+                        self.opt_g,
+                        start_factor=0.1,
+                        end_factor=1.0,
+                        total_iters=warmup,
+                    ),
+                    CosineAnnealingLR(
+                        self.opt_g, T_max=max(remaining - warmup, 1), eta_min=1e-6
+                    ),
+                ],
+                milestones=[warmup],
+            )
+        else:
+            self.sched_g = CosineAnnealingLR(self.opt_g, T_max=remaining, eta_min=1e-6)
+        log.info(
+            "  New phase-2 schedule: lr=%.2e → eta_min=1e-6 over %d epochs "
+            "(warmup=%d)",
+            cfg.lr_phase2,
+            remaining,
+            warmup,
+        )
 
     # ------------------------------------------------------------------
     # Core train / val steps
@@ -482,31 +542,70 @@ class PUWDMTrainer:
         running: dict[str, float] = {}
         n_batches = len(self.train_loader)
 
+        # perceptual/histogram are only computed on the subset of samples
+        # with t < LOW_T_THRESHOLD (~20% at default settings). Most batches
+        # contribute a loss of exactly 0 for these terms. Averaging that
+        # naively over n_batches mixes real signal with pure "did this batch
+        # happen to draw a low-t sample" noise. Instead, accumulate a
+        # sample-count-weighted average so the reported/logged value
+        # reflects the true mean over samples that actually contributed —
+        # this is what should be watched to judge whether these losses are
+        # actually decreasing.
+        low_t_weighted = {"perceptual": 0.0, "histogram": 0.0}
+        low_t_total = 0
+
         for i, batch in enumerate(self.train_loader):
             losses = self._train_step(batch, phase=phase)
+            count = int(losses.pop("low_t_count", 0))
             for k, v in losses.items():
+                if k in ("perceptual", "histogram"):
+                    continue
                 running[k] = running.get(k, 0.0) + v
+            if count > 0:
+                low_t_total += count
+                low_t_weighted["perceptual"] += losses["perceptual"] * count
+                low_t_weighted["histogram"] += losses["histogram"] * count
 
             if (i + 1) % 20 == 0:
                 step_losses = {k: v / (i + 1) for k, v in running.items()}
+                running_perc = (
+                    low_t_weighted["perceptual"] / low_t_total if low_t_total else 0.0
+                )
+                running_hist = (
+                    low_t_weighted["histogram"] / low_t_total if low_t_total else 0.0
+                )
                 log.info(
-                    "  step %4d/%d  total=%.4f  diff=%.4f  perc=%.4f  hist=%.4f",
+                    "  step %4d/%d  total=%.4f  diff=%.4f  perc=%.4f  hist=%.4f  "
+                    "(low_t_samples=%d)",
                     i + 1,
                     n_batches,
                     step_losses.get("total", 0),
                     step_losses.get("diffusion", 0),
-                    step_losses.get("perceptual", 0),
-                    step_losses.get("histogram", 0),
+                    running_perc,
+                    running_hist,
+                    low_t_total,
                 )
 
         avg = {k: v / n_batches for k, v in running.items()}
+        if low_t_total > 0:
+            avg["perceptual"] = low_t_weighted["perceptual"] / low_t_total
+            avg["histogram"] = low_t_weighted["histogram"] / low_t_total
+        else:
+            avg["perceptual"] = 0.0
+            avg["histogram"] = 0.0
+        avg["low_t_samples_per_epoch"] = float(low_t_total)
+
         elapsed = time.perf_counter() - t0
         log.info(
-            "Epoch %3d/%d  [train]  total=%.4f  diff=%.4f  time=%.0fs",
+            "Epoch %3d/%d  [train]  total=%.4f  diff=%.4f  perc=%.4f  hist=%.4f  "
+            "low_t_n=%d  time=%.0fs",
             epoch,
             self.cfg.total_epochs,
             avg.get("total", 0),
             avg.get("diffusion", 0),
+            avg.get("perceptual", 0),
+            avg.get("histogram", 0),
+            low_t_total,
             elapsed,
         )
         return avg
@@ -528,12 +627,17 @@ class PUWDMTrainer:
     # Checkpoint resume
     # ------------------------------------------------------------------
 
-    def _try_resume(self, ckpt_path: Optional[str]) -> int:
-        if ckpt_path is None:
-            return 1
-
-        log.info("Resuming from %s", ckpt_path)
-        ck = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+    def _load_checkpoint_state(self, ck: dict) -> None:
+        """
+        Load model/optimizer/scheduler/scaler state from an already-read
+        checkpoint dict. Caller (fit()) must first call _enter_phase1() or
+        _enter_phase2() — based on the checkpoint's epoch — so self.opt_g /
+        self.sched_g already have the correct shape/type for this phase
+        before their state is overwritten here. This ordering matters now
+        that phase 2 uses a different scheduler than phase 1: loading state
+        into the wrong-shaped scheduler would silently corrupt it (plain
+        __dict__.update under the hood) or error outright.
+        """
         self.model.load_state_dict(ck["model_state"])
         self.opt_g.load_state_dict(ck["opt_g_state"])
         self.opt_d.load_state_dict(ck["opt_d_state"])
@@ -544,7 +648,7 @@ class PUWDMTrainer:
         ema_state = ck.get("ema_state")
         if ema_state is not None and getattr(self.model, "_ema", None) is not None:
             self.model._ema.shadow = ema_state
-        return ck["epoch"] + 1
+        log.info("Restored model/optimizer/scheduler/scaler state from checkpoint.")
 
     def load_weights_from(self, ckpt_path: str) -> None:
         """
@@ -579,14 +683,27 @@ class PUWDMTrainer:
 
     def fit(self, resume_from: Optional[str] = None) -> None:
         cfg = self.cfg
-        start_epoch = self._try_resume(resume_from)
+
+        ck = None
+        if resume_from is not None:
+            log.info("Resuming from %s", resume_from)
+            ck = torch.load(resume_from, map_location=self.device, weights_only=False)
+            start_epoch = ck["epoch"] + 1
+        else:
+            start_epoch = 1
         log.info("Starting from epoch %d", start_epoch)
 
+        # Build the phase-appropriate optimizer LR / scheduler shape FIRST,
+        # then load checkpoint state into it (see _load_checkpoint_state
+        # docstring for why this order matters).
         phase = 2 if start_epoch > cfg.phase1_epochs else 1
         if phase == 1:
             self._enter_phase1()
         else:
             self._enter_phase2()
+
+        if ck is not None:
+            self._load_checkpoint_state(ck)
 
         for epoch in range(start_epoch, cfg.total_epochs + 1):
 

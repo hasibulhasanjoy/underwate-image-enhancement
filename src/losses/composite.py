@@ -183,7 +183,16 @@ class CompositeLoss(nn.Module):
         # 2–5. Image-level losses — only where x0_pred is meaningful
         # Find batch indices where t < LOW_T_THRESHOLD
         low_t_mask = timesteps < LOW_T_THRESHOLD  # (B,)
-        has_low_t = low_t_mask.any()
+        low_t_count = int(low_t_mask.sum().item())
+        has_low_t = low_t_count > 0
+
+        # Exposed so the trainer can compute a sample-count-weighted epoch
+        # average for perceptual/histogram instead of a naive per-batch
+        # average — most batches contribute 0 qualifying samples at
+        # batch_size=8 (~20% gate rate), and averaging those zero-loss
+        # batches in with real ones adds pure sampling noise to the logged
+        # trend without reflecting anything about training quality.
+        losses["low_t_count"] = low_t_count
 
         # Adversarial (disabled in both phases — kept for API compat)
         losses["adversarial"] = zero
