@@ -25,6 +25,12 @@ unified ``nn.Module`` suitable for training and inference:
           ┌────────────▼─────────────┐
           │  SwinUNetDenoiser         │   predicts ε_θ(x_t, t, cond)
           │  (src.models.swin_unet)   │
+          └────────────┬─────────────┘
+                       │  eps_pred → x̂_0 (per DDIM step)
+          ┌────────────▼─────────────┐
+          │  RedChannelCompensation   │   physics-guided red-channel gate
+          │  (src.models.red_channel_ │   J_r_phys(raw, A, t_r) ⊕ x̂_0_red
+          │   compensation)           │
           └──────────────────────────┘
 
 Training loop usage
@@ -72,6 +78,10 @@ from torch import Tensor
 from src.models.conditioning import ConditioningNetworks
 from src.models.diffusion import DDIMScheduler
 from src.models.swin_unet import SwinUNetDenoiser, SwinUNetConfig
+from src.models.red_channel_compensation import (
+    RedChannelCompensation,
+    RedChannelCompensationConfig,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
@@ -104,6 +114,17 @@ class PUWDMConfig:
         ``model.update_ema()``.  Default True.
     ema_decay : float
         EMA smoothing coefficient.  Default 0.9999.
+    use_red_channel_compensation : bool
+        Enable the physics-guided Red Channel Compensation (RCC) module
+        (see src.models.red_channel_compensation). Matches the "Red
+        Channel Compensation" block in the architecture diagram, sitting
+        between the decoder's x̂_0 estimate and DDIM sampling. Default True.
+        Set False to reproduce the exact pre-RCC pipeline (e.g. for an
+        ablation run, or to load a checkpoint trained before RCC existed
+        without ever exercising the module).
+    rcc_cfg : RedChannelCompensationConfig
+        Hyper-parameters for the RCC module (ignored if
+        ``use_red_channel_compensation`` is False).
     """
 
     denoiser_cfg: SwinUNetConfig = field(default_factory=SwinUNetConfig)
@@ -114,6 +135,10 @@ class PUWDMConfig:
     clip_denoised: bool = True
     use_ema: bool = True
     ema_decay: float = 0.999
+    use_red_channel_compensation: bool = True
+    rcc_cfg: RedChannelCompensationConfig = field(
+        default_factory=RedChannelCompensationConfig
+    )
 
     def __post_init__(self) -> None:
         # Keep cond_embed_dim consistent between the wrapper and the denoiser
@@ -238,6 +263,11 @@ class PUWDM(nn.Module):
             clip_denoised=cfg.clip_denoised,
         )
 
+        # ── Red Channel Compensation (physics-guided) ────────────────
+        self.red_comp: Optional[RedChannelCompensation] = None
+        if cfg.use_red_channel_compensation:
+            self.red_comp = RedChannelCompensation(cfg.rcc_cfg)
+
         # ── EMA (denoiser only — cond_nets are fast to optimise) ─────
         self._ema: Optional[EMAModel] = None
         if cfg.use_ema:
@@ -346,7 +376,10 @@ class PUWDM(nn.Module):
             noise_target  : (B, C, H, W)
             timesteps     : (B,)
             alphas_cumprod: (T,)            — for SNR weighting
-            enhanced      : (B, C, H, W)   — single-step x̂_0 estimate
+            enhanced      : (B, C, H, W)   — single-step x̂_0 estimate, after
+                            Red Channel Compensation (if enabled)
+            rcc_alpha     : (B, 1, H, W) or None — RCC's learned trust mask,
+                            for diagnostics; None if RCC is disabled
             refined_map   : (B, 1, H, W)   — from T-Net
             a_embedding   : (B, E)
             t_embedding   : (B, E)
@@ -380,7 +413,25 @@ class PUWDM(nn.Module):
         # 5. Single-step denoised estimate (for perceptual/histogram/adv losses)
         #    x̂_0 = (x_t − √(1-ᾱ_t)·ε_pred) / √ᾱ_t
         with torch.no_grad():
-            enhanced = self.scheduler.predict_x0_from_eps(x_t, t, eps_pred.detach())
+            enhanced_raw = self.scheduler.predict_x0_from_eps(x_t, t, eps_pred.detach())
+
+        # 6. Red Channel Compensation — physics-guided correction of the
+        #    decoder's x̂_0 estimate before it is consumed by image-level
+        #    losses (perceptual/histogram), matching the architecture
+        #    diagram's Decoder → Red Channel Compensation ordering. Note
+        #    enhanced_raw is a detached constant here (see step 5); RCC's
+        #    own gating parameters still receive gradient from
+        #    perceptual/histogram loss through this call.
+        if self.red_comp is not None:
+            enhanced, rcc_alpha = self.red_comp(
+                pred=enhanced_raw,
+                raw=raw,
+                ambient=physics_A,
+                transmission=cond_out["refined_map"],
+            )
+        else:
+            enhanced = enhanced_raw
+            rcc_alpha = None
 
         return {
             "noise_pred": eps_pred,
@@ -388,6 +439,7 @@ class PUWDM(nn.Module):
             "timesteps": t,
             "alphas_cumprod": self.scheduler.alphas_cumprod,
             "enhanced": enhanced,
+            "rcc_alpha": rcc_alpha,
             "refined_map": cond_out["refined_map"],
             "a_embedding": cond_out["a_embedding"],
             "t_embedding": cond_out["t_embedding"],
@@ -451,6 +503,25 @@ class PUWDM(nn.Module):
                 raw=raw,
             )
 
+        # Red Channel Compensation hook — applied to the decoder's x̂_0
+        # estimate at every DDIM step (and therefore also on the final
+        # step, which becomes the returned "Enhanced Output"), matching
+        # the architecture diagram's Decoder → Red Channel Compensation →
+        # DDIM Sampling ordering.
+        x0_correction_fn = None
+        if self.red_comp is not None:
+
+            def _x0_correction(x0_pred: Tensor, t_step: Tensor) -> Tensor:
+                corrected, _ = self.red_comp(
+                    pred=x0_pred,
+                    raw=raw,
+                    ambient=physics_A,
+                    transmission=cond_out["refined_map"],
+                )
+                return corrected
+
+            x0_correction_fn = _x0_correction
+
         ctx = self.ema_context() if use_ema else _NullContext()
         with ctx:
             enhanced = self.scheduler.ddim_sample_loop(
@@ -460,6 +531,7 @@ class PUWDM(nn.Module):
                 num_steps=num_steps,
                 eta=eta,
                 progress=progress,
+                x0_correction_fn=x0_correction_fn,
             )
 
         return enhanced
@@ -479,11 +551,13 @@ class PUWDM(nn.Module):
             )
             return sum(p.numel() for p in params)
 
-        return {
+        counts = {
             "cond_nets": _count(self.cond_nets),
             "denoiser": _count(self.denoiser),
-            "total": _count(self),
         }
+        counts["red_comp"] = _count(self.red_comp) if self.red_comp is not None else 0
+        counts["total"] = _count(self)
+        return counts
 
     def __repr__(self) -> str:
         counts = self.num_parameters()
@@ -491,6 +565,8 @@ class PUWDM(nn.Module):
             f"PUWDM(\n"
             f"  cond_nets  : {counts['cond_nets']:>12,} params\n"
             f"  denoiser   : {counts['denoiser']:>12,} params\n"
+            f"  red_comp   : {counts['red_comp']:>12,} params"
+            f" ({'enabled' if self.red_comp is not None else 'disabled'})\n"
             f"  total      : {counts['total']:>12,} params\n"
             f"  scheduler  : {self.scheduler}\n"
             f"  ema        : {'enabled' if self._ema else 'disabled'}\n"

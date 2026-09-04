@@ -124,6 +124,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lsui_raw_dir", default="dataset/LSUI/input")
     p.add_argument("--lsui_ref_dir", default="dataset/LSUI/GT")
 
+    # Red Channel Compensation (NEW)
+    p.add_argument(
+        "--no_red_channel_compensation",
+        action="store_true",
+        help="Disable the physics-guided Red Channel Compensation module "
+        "(the 'Red Channel Compensation' block in the architecture "
+        "diagram). Useful for an ablation run, or to exactly reproduce a "
+        "pre-RCC training pipeline.",
+    )
+
     # Mode: full resume (restores optimizer/scheduler/epoch count)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--checkpoint", default=None)
@@ -189,7 +199,9 @@ def main() -> None:
         use_lsui=args.use_lsui,
         lsui_raw_dir=args.lsui_raw_dir,
         lsui_ref_dir=args.lsui_ref_dir,
-        model=PUWDMConfig(),
+        model=PUWDMConfig(
+            use_red_channel_compensation=not args.no_red_channel_compensation
+        ),
     )
 
     trainer = PUWDMTrainer(cfg)

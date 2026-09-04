@@ -229,6 +229,7 @@ class DDIMScheduler:
         t_prev: Tensor,
         eps_pred: Tensor,
         eta: float = 0.0,
+        x0_correction_fn: Optional[Callable[[Tensor, Tensor], Tensor]] = None,
     ) -> Tensor:
         """
         Single DDIM reverse step:  x_t  →  x_{t_prev}.
@@ -242,6 +243,14 @@ class DDIMScheduler:
         t_prev   : (B,)  previous (lower) timestep; use -1 for the final step
         eps_pred : (B, C, H, W)  noise prediction from the denoiser
         eta      : float  stochasticity (0 = deterministic DDIM)
+        x0_correction_fn : optional callable (x0_pred, t) → x0_pred
+            Applied to the predicted clean-image estimate x0_pred right
+            after it is derived from eps_pred, before it is used to build
+            x_{t_prev}. This is the hook used by Red Channel Compensation
+            (see src.models.red_channel_compensation), matching its place
+            in the architecture diagram: Decoder → Red Channel
+            Compensation → DDIM Sampling. Defaults to None, which
+            reproduces the exact original behaviour.
 
         Returns
         -------
@@ -251,6 +260,14 @@ class DDIMScheduler:
 
         # Predict x_0
         x0_pred = self.predict_x0_from_eps(x_t, t, eps_pred)
+
+        # Physics-guided correction hook (e.g. Red Channel Compensation).
+        # Re-clamp afterwards since the correction is free to move values
+        # slightly outside [0, 1] before blending.
+        if x0_correction_fn is not None:
+            x0_pred = x0_correction_fn(x0_pred, t)
+            if self.clip_denoised:
+                x0_pred = x0_pred.clamp(0.0, 1.0)
 
         # On the very last step (t_prev == 0), just return the clean estimate
         # rather than re-adding noise direction which would corrupt the output.
@@ -293,6 +310,7 @@ class DDIMScheduler:
         eta: float = 0.0,
         x_T: Optional[Tensor] = None,
         progress: bool = False,
+        x0_correction_fn: Optional[Callable[[Tensor, Tensor], Tensor]] = None,
         **model_kwargs,
     ) -> Tensor:
         """
@@ -316,6 +334,11 @@ class DDIMScheduler:
         eta       : float  stochasticity (0 = deterministic)
         x_T       : Tensor or None  starting noise; sampled if None
         progress  : bool   print step counter
+        x0_correction_fn : optional callable (x0_pred, t) → x0_pred
+            Forwarded to every ddim_step() call — see its docstring.
+            Applied at every reverse step (including the final one, which
+            is what actually becomes "Enhanced Output"). Defaults to None,
+            which reproduces the exact original behaviour.
 
         Returns
         -------
@@ -347,7 +370,14 @@ class DDIMScheduler:
             )
 
             eps_pred = model_fn(x, t_tensor, **model_kwargs)
-            x = self.ddim_step(x, t_tensor, t_prev_tensor, eps_pred, eta=eta)
+            x = self.ddim_step(
+                x,
+                t_tensor,
+                t_prev_tensor,
+                eps_pred,
+                eta=eta,
+                x0_correction_fn=x0_correction_fn,
+            )
 
             if progress:
                 print(

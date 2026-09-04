@@ -14,3 +14,7 @@ from src.models.blocks import (
 )
 from src.models.swin_unet import SwinUNetDenoiser, SwinUNetConfig
 from src.models.conditioning import ANet, TNet, ConditioningNetworks
+from src.models.red_channel_compensation import (
+    RedChannelCompensation,
+    RedChannelCompensationConfig,
+)

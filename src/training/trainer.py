@@ -637,8 +637,31 @@ class PUWDMTrainer:
         that phase 2 uses a different scheduler than phase 1: loading state
         into the wrong-shaped scheduler would silently corrupt it (plain
         __dict__.update under the hood) or error outright.
+
+        strict=False on the model load: checkpoints saved before the Red
+        Channel Compensation (RCC) module existed have no `red_comp.*`
+        keys. Loading them with strict=True would raise. With strict=False
+        those keys are simply reported as missing and RCC keeps its
+        (random) initialisation — expected the first time you resume an
+        older run under the new code; RCC then trains from scratch
+        alongside everything else.
         """
-        self.model.load_state_dict(ck["model_state"])
+        missing, unexpected = self.model.load_state_dict(
+            ck["model_state"], strict=False
+        )
+        if missing:
+            log.warning(
+                "Checkpoint missing %d model key(s) (new module(s) added since "
+                "this checkpoint was saved — starting them from random init): %s",
+                len(missing),
+                missing,
+            )
+        if unexpected:
+            log.warning(
+                "Checkpoint had %d unexpected model key(s), ignored: %s",
+                len(unexpected),
+                unexpected,
+            )
         self.opt_g.load_state_dict(ck["opt_g_state"])
         self.opt_d.load_state_dict(ck["opt_d_state"])
         self.sched_g.load_state_dict(ck["sched_g_state"])
@@ -667,7 +690,25 @@ class PUWDMTrainer:
             ckpt_path,
         )
         ck = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(ck["model_state"])
+        # strict=False: see _load_checkpoint_state docstring — tolerates
+        # loading a pre-RCC checkpoint into a model that now has the Red
+        # Channel Compensation module.
+        missing, unexpected = self.model.load_state_dict(
+            ck["model_state"], strict=False
+        )
+        if missing:
+            log.warning(
+                "Checkpoint missing %d model key(s) (new module(s) added since "
+                "this checkpoint was saved — starting them from random init): %s",
+                len(missing),
+                missing,
+            )
+        if unexpected:
+            log.warning(
+                "Checkpoint had %d unexpected model key(s), ignored: %s",
+                len(unexpected),
+                unexpected,
+            )
         ema_state = ck.get("ema_state")
         if ema_state is not None and getattr(self.model, "_ema", None) is not None:
             self.model._ema.shadow = ema_state
