@@ -338,6 +338,14 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--num_steps", type=int, default=50)
     p.add_argument("--out_dir", default=None)
+    p.add_argument(
+        "--red_channel_compensation",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Whether to evaluate with Red Channel Compensation. 'auto' "
+        "(default) detects it from the checkpoint itself. See evaluate.py "
+        "--help for the full explanation.",
+    )
 
     p.add_argument(
         "--quick",
@@ -379,7 +387,13 @@ def main() -> None:
         out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    model = load_model(args.checkpoint, device)
+    model = load_model(
+        args.checkpoint,
+        device,
+        use_red_channel_compensation={"auto": None, "on": True, "off": False}[
+            args.red_channel_compensation
+        ],
+    )
     epoch_label = get_epoch_label(args.checkpoint)
 
     ssim_fn, psnr_fn = _import_skimage()
@@ -390,7 +404,12 @@ def main() -> None:
         num_workers=args.num_workers,
     )
     n_test = len(test_loader.dataset)
-    log.info("Test set size: %d images (checkpoint epoch=%s)", n_test, epoch_label)
+    log.info(
+        "Test set size: %d images (checkpoint epoch=%s, RCC=%s)",
+        n_test,
+        epoch_label,
+        "enabled" if model.red_comp is not None else "disabled",
+    )
 
     all_results: List[Dict] = []
 
@@ -458,6 +477,7 @@ def main() -> None:
             "═" * 60,
             f"  Checkpoint  : {args.checkpoint}  (epoch {epoch_label})",
             f"  DDIM steps  : {args.num_steps}",
+            f"  Red Chan. Comp. : {'ENABLED' if model.red_comp is not None else 'disabled'}",
             f"  Test images : {len(all_results)}",
             "─" * 60,
         ]

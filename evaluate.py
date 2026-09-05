@@ -210,16 +210,60 @@ def _strip_compiled_prefix(state_dict: dict) -> dict:
     return stripped
 
 
-def load_model(checkpoint_path: str, device: torch.device):
-    """Load PUWDM from a training checkpoint and return it in eval mode."""
+def load_model(
+    checkpoint_path: str,
+    device: torch.device,
+    use_red_channel_compensation: "bool | None" = None,
+):
+    """
+    Load PUWDM from a training checkpoint and return it in eval mode.
+
+    Parameters
+    ----------
+    use_red_channel_compensation : bool or None
+        Controls whether the model is instantiated with the Red Channel
+        Compensation (RCC) module.
+          * None (default) — AUTO-DETECT from the checkpoint itself: if
+            `model_state` contains any `red_comp.*` keys, RCC is enabled;
+            otherwise it's disabled. This is important — without it, a
+            checkpoint trained with `--no_red_channel_compensation` (or
+            any checkpoint saved before RCC existed) would silently get a
+            *randomly-initialized* RCC module bolted on at eval time
+            (strict=False lets the load succeed, masking the mismatch).
+            That would inject an untrained ~12%-weighted physics-red blend
+            into a model that was never trained to expect it, quietly
+            corrupting exactly the kind of baseline/ablation comparison
+            this evaluation script exists to produce.
+          * True / False — explicit override, e.g. to force-evaluate a
+            checkpoint's denoiser alone with RCC disabled regardless of
+            what's in the checkpoint (rarely needed; auto-detect is
+            correct for the normal case of evaluating a checkpoint as it
+            was actually trained).
+    """
     from src.models.p_uwdm import PUWDM, PUWDMConfig
 
     log.info("Loading checkpoint: %s", checkpoint_path)
     ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    # Instantiate a plain (uncompiled) model for inference
-    model = PUWDM(PUWDMConfig())
     model_state = _strip_compiled_prefix(ck["model_state"])
+
+    if use_red_channel_compensation is None:
+        detected_rcc = any(k.startswith("red_comp.") for k in model_state)
+        use_red_channel_compensation = detected_rcc
+        log.info(
+            "Red Channel Compensation: AUTO-DETECTED %s from checkpoint contents.",
+            "ENABLED" if detected_rcc else "DISABLED (no red_comp.* keys found)",
+        )
+    else:
+        log.info(
+            "Red Channel Compensation: EXPLICITLY %s (overriding checkpoint contents).",
+            "ENABLED" if use_red_channel_compensation else "DISABLED",
+        )
+
+    # Instantiate a plain (uncompiled) model for inference
+    model = PUWDM(
+        PUWDMConfig(use_red_channel_compensation=use_red_channel_compensation)
+    )
     missing, unexpected = model.load_state_dict(model_state, strict=False)
     if missing:
         log.warning("Missing keys in model_state (%d): %s", len(missing), missing[:5])
@@ -552,6 +596,17 @@ def parse_args():
         "checkpoints (e.g. best.pt vs epoch_0300.pt) never silently "
         "overwrites a previous run's metrics/visuals.",
     )
+    p.add_argument(
+        "--red_channel_compensation",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Whether to evaluate with the Red Channel Compensation module. "
+        "'auto' (default) detects it from the checkpoint itself — correct "
+        "for evaluating a checkpoint as it was actually trained. Use 'off' "
+        "to force-disable RCC even if the checkpoint has it (or 'on' to "
+        "force-enable) for a controlled comparison; this does NOT change "
+        "which weights are loaded, only whether RCC's forward pass runs.",
+    )
     return p.parse_args()
 
 
@@ -580,7 +635,12 @@ def main():
         visual_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load model ────────────────────────────────────────────────────────
-    model = load_model(args.checkpoint, device)
+    rcc_override = {"auto": None, "on": True, "off": False}[
+        args.red_channel_compensation
+    ]
+    model = load_model(
+        args.checkpoint, device, use_red_channel_compensation=rcc_override
+    )
 
     # ── LPIPS (lazy) ──────────────────────────────────────────────────────
     lpips_mod = _import_lpips()
@@ -666,6 +726,7 @@ def main():
         "═" * 55,
         f"  Checkpoint  : {args.checkpoint}",
         f"  DDIM steps  : {args.num_steps}",
+        f"  Red Chan. Comp. : {'ENABLED' if model.red_comp is not None else 'disabled'}",
         f"  Test images : {len(all_results)}",
         "─" * 55,
         f"  PSNR   (↑)  : {agg['psnr']:.4f} dB   ± {agg_std['psnr']:.4f}   [target >22]",
@@ -695,7 +756,11 @@ def main():
     json_path = out_dir / "aggregate.json"
     json_path.write_text(
         json.dumps(
-            {k: {"mean": float(agg[k]), "std": float(agg_std[k])} for k in keys},
+            {
+                "checkpoint": args.checkpoint,
+                "red_channel_compensation": model.red_comp is not None,
+                **{k: {"mean": float(agg[k]), "std": float(agg_std[k])} for k in keys},
+            },
             indent=2,
         )
     )

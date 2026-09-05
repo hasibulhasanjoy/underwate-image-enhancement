@@ -142,3 +142,6 @@ results_epoch100/
 result*/
 test.py
 thesis_results*/
+
+progress_log.csv
+quick_results*/
