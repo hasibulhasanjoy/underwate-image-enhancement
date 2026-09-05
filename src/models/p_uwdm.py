@@ -82,6 +82,7 @@ from src.models.red_channel_compensation import (
     RedChannelCompensation,
     RedChannelCompensationConfig,
 )
+from src.losses.composite import LOW_T_THRESHOLD
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
@@ -504,21 +505,48 @@ class PUWDM(nn.Module):
             )
 
         # Red Channel Compensation hook — applied to the decoder's x̂_0
-        # estimate at every DDIM step (and therefore also on the final
-        # step, which becomes the returned "Enhanced Output"), matching
-        # the architecture diagram's Decoder → Red Channel Compensation →
-        # DDIM Sampling ordering.
+        # estimate, matching the architecture diagram's Decoder → Red
+        # Channel Compensation → DDIM Sampling ordering, on the final
+        # step which becomes the "Enhanced Output".
+        #
+        # CRITICAL: only applied when t < LOW_T_THRESHOLD (200), exactly
+        # matching the gate composite.py already uses to decide when
+        # x0_pred is a meaningful clean-image estimate at all (see its
+        # docstring: 1/√ᾱ_t amplifies any eps_pred error into x0_pred by
+        # >20,000× at t=999 vs ~1.05× at t=200). RCC is only ever trained
+        # on low-t x0 estimates via that same gate — feeding it high-t
+        # x0_pred (which is mostly noise) at every one of ~40 early DDIM
+        # steps is a severe train/inference distribution mismatch: RCC
+        # blends in a physics-computed red channel (always "plausible"
+        # looking, since it's a deterministic function of the raw image)
+        # into what is essentially noise, repeatedly, corrupting the
+        # entire reverse trajectory before the image has a chance to
+        # form. This produced a catastrophic PSNR/SSIM regression
+        # (14.10/0.596 vs a 19.47/0.845 baseline) despite training-time
+        # perceptual/histogram loss looking fine — because training never
+        # exercises this full high-t inference pathway in the first
+        # place. Gating here restores exactly the distribution RCC was
+        # trained on.
         x0_correction_fn = None
         if self.red_comp is not None:
 
             def _x0_correction(x0_pred: Tensor, t_step: Tensor) -> Tensor:
+                low_t_mask = t_step < LOW_T_THRESHOLD
+                if not bool(low_t_mask.any()):
+                    return x0_pred
                 corrected, _ = self.red_comp(
                     pred=x0_pred,
                     raw=raw,
                     ambient=physics_A,
                     transmission=cond_out["refined_map"],
                 )
-                return corrected
+                # Per-sample gate: only replace x0_pred where t < threshold
+                # for that sample: at batch-level all samples share the
+                # same t during DDIM sampling (unlike training's per-sample
+                # random t), but this keeps the function correct even if
+                # sample() is ever called with per-sample timesteps.
+                mask = low_t_mask.view(-1, 1, 1, 1).to(x0_pred.dtype)
+                return mask * corrected + (1.0 - mask) * x0_pred
 
             x0_correction_fn = _x0_correction
 
