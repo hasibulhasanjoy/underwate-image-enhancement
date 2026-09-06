@@ -15,14 +15,24 @@ Three modes, all through this one script:
 3. Weights-only init (loads ONLY model + EMA weights from a checkpoint,
    then starts a FRESH optimizer/scheduler/epoch count — use this when
    starting a new fine-tuning phase with a different loss composition or
-   dataset, e.g. the combined UIEB+LSUI phase1b re-exposure, so the
-   LR schedule gets a proper warmup + decay instead of inheriting an
-   already-decayed one):
+   dataset, e.g. adding the RCC module or the combined UIEB+LSUI
+   re-exposure, so the LR schedule gets a proper warmup + decay instead
+   of inheriting an already-decayed one):
        python train.py --init_weights_from checkpoints_phase3_hist/epoch_0150.pt \\
            --checkpoint_dir checkpoints_phase1b_lsui \\
            --log_dir runs/p_uwdm_phase1b_lsui \\
-           --total_epochs 120 --phase1_epochs 120 \\
+           --total_epochs 120 \\
            --use_lsui --lsui_raw_dir dataset/LSUI/input --lsui_ref_dir dataset/LSUI/GT
+
+   IMPORTANT: for this mode, trainer.py now controls which phase/LR the
+   run starts in via --finetune_phase (default 2 = safe fine-tune:
+   diffusion+perceptual+histogram at --lr_phase2). --phase1_epochs is
+   NOT consulted for mode 3 anymore — it only matters for modes 1/2.
+   Do not set --finetune_phase 1 unless you deliberately want to redo
+   Phase 1's from-scratch diffusion-only training at --lr_generator on
+   top of the loaded weights (this WILL catastrophically forget an
+   already-converged checkpoint if used by mistake — see trainer.py's
+   load_weights_from() docstring, item 8 in the module header).
 
 Examples for the shared-GPU / small-VRAM case:
     python train.py --batch_size 8             # smaller batch (shared GPU)
@@ -151,6 +161,35 @@ def parse_args() -> argparse.Namespace:
             "Mutually exclusive with --resume/--checkpoint."
         ),
     )
+    p.add_argument(
+        "--finetune_phase",
+        type=int,
+        choices=[1, 2],
+        default=2,
+        help=(
+            "Only used with --init_weights_from. Which phase/schedule the "
+            "new run starts in: 2 (default, SAFE) = diffusion+perceptual+"
+            "histogram at --lr_phase2, appropriate for adding a module "
+            "(e.g. RCC) or a dataset to an already phase-2/3-converged "
+            "checkpoint. 1 (DANGEROUS) = from-scratch diffusion-only loss "
+            "at --lr_generator, resetting the optimizer to a from-scratch "
+            "LR — only for cases like a changed denoiser architecture "
+            "that genuinely needs noise prediction relearned from "
+            "scratch. Using 1 on an already-converged checkpoint by "
+            "mistake causes catastrophic forgetting (confirmed: PSNR "
+            "18.26 -> 12.57 dB in 20 epochs on this project)."
+        ),
+    )
+    p.add_argument(
+        "--finetune_lr",
+        type=float,
+        default=None,
+        help=(
+            "Only used with --init_weights_from and --finetune_phase 2. "
+            "Overrides --lr_phase2 for this run specifically. Leave unset "
+            "to just use --lr_phase2."
+        ),
+    )
 
     args = p.parse_args()
 
@@ -160,6 +199,11 @@ def parse_args() -> argparse.Namespace:
             "Use --init_weights_from for a fresh fine-tuning phase, or "
             "--resume/--checkpoint to literally continue an interrupted run."
         )
+
+    if (
+        args.finetune_phase != 2 or args.finetune_lr is not None
+    ) and not args.init_weights_from:
+        p.error("--finetune_phase/--finetune_lr only apply with --init_weights_from.")
 
     return args
 
@@ -208,10 +252,24 @@ def main() -> None:
 
     if args.init_weights_from:
         log.info(
-            "Mode: WEIGHTS-ONLY INIT from %s — fresh optimizer/scheduler/epoch count",
+            "Mode: WEIGHTS-ONLY INIT from %s — fresh optimizer/scheduler/epoch "
+            "count, finetune_phase=%d%s",
             args.init_weights_from,
+            args.finetune_phase,
+            f", finetune_lr={args.finetune_lr:.2e}" if args.finetune_lr else "",
         )
-        trainer.load_weights_from(args.init_weights_from)
+        if args.finetune_phase == 1:
+            log.warning(
+                "--finetune_phase 1 requested: this WILL restart from-scratch "
+                "diffusion-only training at lr_generator=%.1e on top of the "
+                "loaded weights. Double check this is really what you want.",
+                args.lr_generator,
+            )
+        trainer.load_weights_from(
+            args.init_weights_from,
+            finetune_phase=args.finetune_phase,
+            finetune_lr=args.finetune_lr,
+        )
         trainer.fit(resume_from=None)
         return
 

@@ -41,6 +41,26 @@ Key changes from original
    corrupting the ambient/transmission/degradation conditioning priors in
    every run to date. See src/data/physics_dataset.py module docstring
    (BUG-3) for full detail.
+
+8. FIXED — load_weights_from() + fit() phase-selection bug. Previously,
+   fit(resume_from=None) unconditionally entered Phase 1 (from-scratch
+   diffusion-only loss, fresh optimizer @ lr=cfg.lr_generator) whenever a
+   run was started with load_weights_from(), REGARDLESS of how converged
+   the source checkpoint already was. Adding the RCC module to a
+   phase-2/3-converged checkpoint this way caused a confirmed
+   catastrophic-forgetting regression: PSNR 18.26 -> 12.57 dB (SSIM
+   0.779 -> 0.388) within 20 epochs, reproduced near-identically with RCC
+   disabled at eval time too — proving the collapse was in the shared
+   denoiser backbone, not the RCC module itself (RCC's own earlier
+   high-t-gating bug was already fixed correctly, per the comment in
+   PUWDM.sample()). Fix: load_weights_from(finetune_phase=2, finetune_lr=
+   ...) now defaults to the safe Phase-2 fine-tune schedule and records
+   it for fit() to honor; Phase 1 is now an explicit, loudly-warned opt-in
+   (finetune_phase=1) rather than the silent default. A post-load
+   eps_pred-std smoke test also now runs immediately in
+   load_weights_from(), so a bad/partial weight load is caught before any
+   training time is spent, rather than discovered only via a full
+   evaluate.py run 20 epochs later.
 """
 
 from __future__ import annotations
@@ -243,6 +263,19 @@ class PUWDMTrainer:
         self.global_step = 0
         self.best_val_loss = math.inf
 
+        # Set by load_weights_from() to tell fit() which phase/LR a
+        # weights-only fresh start should actually begin in. None means
+        # "no weights-only init happened" -> fit() falls back to its
+        # original epoch-count-based Phase 1/2 selection.
+        # See load_weights_from()'s docstring for the failure mode this
+        # closes: silently re-entering Phase 1's from-scratch
+        # diffusion-only / lr=cfg.lr_generator schedule on top of weights
+        # that were already converged past Phase 1 causes a catastrophic
+        # forgetting regression (confirmed: PSNR 18.26 -> 12.57 in 20
+        # epochs when this happened).
+        self._weights_only_phase: Optional[int] = None
+        self._weights_only_lr: Optional[float] = None
+
     # ------------------------------------------------------------------
     # Build helpers
     # ------------------------------------------------------------------
@@ -382,18 +415,71 @@ class PUWDMTrainer:
     # ------------------------------------------------------------------
 
     def _enter_phase1(self) -> None:
+        cfg = self.cfg
         log.info("═" * 60)
         log.info(
-            "PHASE 1  (epochs 1–%d): DIFFUSION LOSS ONLY",
-            self.cfg.phase1_epochs,
+            "PHASE 1  (epochs 1–%d): DIFFUSION LOSS ONLY, fresh optimizer @ lr=%.1e",
+            cfg.phase1_epochs,
+            cfg.lr_generator,
         )
         log.info("  eps_pred std should rise from ~0.1 → ~1.0 by epoch 40")
         log.info("═" * 60)
+        # GUARD: this schedule is designed for training a randomly-
+        # initialised denoiser from scratch (from-scratch LR, no
+        # perceptual/histogram supervision). If it is entered on top of
+        # weights loaded via load_weights_from(..., finetune_phase=1) —
+        # i.e. the caller explicitly asked to redo Phase 1 despite
+        # starting from a pretrained checkpoint — make the risk loud and
+        # unmissable in the log, since this exact combination previously
+        # caused a silent catastrophic-forgetting regression (PSNR
+        # 18.26 -> 12.57 dB within 20 epochs).
+        if self._weights_only_phase == 1:
+            log.warning(
+                "⚠" * 30 + "\n"
+                "  Re-entering PHASE 1 on top of PRETRAINED weights "
+                "(load_weights_from(..., finetune_phase=1)). This drops "
+                "perceptual/histogram supervision AND resets the "
+                "optimizer to lr=%.1e — orders of magnitude above the "
+                "eta_min the source checkpoint had annealed to. This is "
+                "only appropriate if you are deliberately re-learning "
+                "noise prediction from scratch (e.g. a changed denoiser "
+                "architecture). For adding a new module (like RCC) to an "
+                "already-converged model, use finetune_phase=2 instead.\n" + "⚠" * 30,
+                cfg.lr_generator,
+            )
         self.criterion.set_phase(1)
         _freeze(self.criterion.discriminator)
 
-    def _enter_phase2(self) -> None:
+    def _enter_phase2(
+        self,
+        lr_override: Optional[float] = None,
+        remaining_epochs: Optional[int] = None,
+    ) -> None:
+        """
+        Enter Phase 2 (diffusion + perceptual + histogram, t<200 only).
+
+        Parameters
+        ----------
+        lr_override : float, optional
+            Use this LR instead of ``cfg.lr_phase2``. Needed so
+            ``load_weights_from(..., finetune_lr=...)`` can request a
+            different (typically lower) fine-tuning LR than whatever a
+            normal phase-1->phase-2 transition would use, without
+            mutating the shared TrainerConfig.
+        remaining_epochs : int, optional
+            Epoch budget the fresh warmup+cosine schedule should span.
+            Defaults to ``cfg.total_epochs - cfg.phase1_epochs`` (correct
+            for the natural phase-1->phase-2 transition and for a resume
+            that lands inside phase 2, where ``_load_checkpoint_state()``
+            immediately overwrites the schedule anyway). A weights-only
+            fresh start that skips phase 1 entirely must instead pass the
+            *actual* remaining budget (``cfg.total_epochs - start_epoch +
+            1``), or the cosine schedule will be silently truncated to
+            ``total_epochs - phase1_epochs`` and spend the rest of
+            training pinned at eta_min.
+        """
         cfg = self.cfg
+        lr = cfg.lr_phase2 if lr_override is None else lr_override
         log.info("═" * 60)
         log.info(
             "PHASE 2  (epochs %d–%d): diffusion + perceptual + histogram (t<200 only)",
@@ -409,14 +495,19 @@ class PUWDMTrainer:
         # subsequent _load_checkpoint_state() call in fit() will immediately
         # overwrite everything set here with the exact saved state — so it's
         # safe to always rebuild unconditionally. This block only actually
-        # changes behavior at the genuine phase-1 → phase-2 transition.
+        # changes behavior at the genuine phase-1 → phase-2 transition (or
+        # a weights-only fresh start routed straight into phase 2).
         if cfg.reset_optimizer_on_phase2:
             self.opt_g.state = defaultdict(dict)
             log.info("  Reset opt_g Adam moment estimates for phase 2.")
         for group in self.opt_g.param_groups:
-            group["lr"] = cfg.lr_phase2
+            group["lr"] = lr
 
-        remaining = max(cfg.total_epochs - cfg.phase1_epochs, 1)
+        remaining = (
+            remaining_epochs
+            if remaining_epochs is not None
+            else max(cfg.total_epochs - cfg.phase1_epochs, 1)
+        )
         warmup = min(cfg.phase2_warmup_epochs, max(remaining - 1, 0))
         if warmup > 0:
             self.sched_g = SequentialLR(
@@ -439,7 +530,7 @@ class PUWDMTrainer:
         log.info(
             "  New phase-2 schedule: lr=%.2e → eta_min=1e-6 over %d epochs "
             "(warmup=%d)",
-            cfg.lr_phase2,
+            lr,
             remaining,
             warmup,
         )
@@ -673,18 +764,56 @@ class PUWDMTrainer:
             self.model._ema.shadow = ema_state
         log.info("Restored model/optimizer/scheduler/scaler state from checkpoint.")
 
-    def load_weights_from(self, ckpt_path: str) -> None:
+    def load_weights_from(
+        self,
+        ckpt_path: str,
+        finetune_phase: int = 2,
+        finetune_lr: Optional[float] = None,
+    ) -> None:
         """
         Load ONLY model + EMA weights from a checkpoint — no optimizer,
-        scheduler, epoch count, or best_val_loss.
+        scheduler, epoch count, or best_val_loss. The new run starts at
+        epoch 1 with its own fresh warmup + cosine schedule (a literal
+        resume would instead restore the old, already-decayed schedule,
+        effectively training at ~eta_min).
 
         Use this (instead of fit(resume_from=...)) when starting a new
-        fine-tuning phase with a different loss composition or dataset
-        (e.g. the combined UIEB+LSUI phase1b re-exposure). A literal resume
-        would also restore the old, already-decayed cosine LR schedule,
-        effectively training the new epochs at ~eta_min. This gives the
-        extension run its own fresh warmup + cosine decay instead.
+        fine-tuning phase with a different loss composition, dataset, or
+        added module (e.g. bolting the RCC module onto an already-trained
+        checkpoint, or the combined UIEB+LSUI re-exposure).
+
+        Parameters
+        ----------
+        finetune_phase : int, default 2
+            Which loss composition / schedule fit() should enter for this
+            run, REGARDLESS of cfg.phase1_epochs:
+              - 2 (default, safe): diffusion + perceptual + histogram,
+                fresh warmup+cosine at `finetune_lr` (or cfg.lr_phase2 if
+                not given). This is almost always what you want when
+                loading weights from a checkpoint that was already past
+                its own Phase 1 — i.e. any checkpoint whose eps_pred std
+                is already ~1.0 and whose PSNR/SSIM already reflect
+                perceptual/histogram-guided training.
+              - 1 (dangerous, opt-in only): diffusion-loss-only, fresh
+                optimizer at cfg.lr_generator (the from-scratch LR).
+                Only use this if you genuinely need to relearn noise
+                prediction from scratch (e.g. a changed denoiser
+                architecture). Applying it on top of an already-converged
+                checkpoint is what caused a confirmed regression from
+                PSNR 18.26 to 12.57 dB within 20 epochs: the fresh
+                lr=2e-4 optimizer combined with dropping perceptual/
+                histogram supervision perturbs already-converged weights
+                far more than a normal fine-tune LR would, and the
+                epsilon-MSE-only objective doesn't defend against it.
+        finetune_lr : float, optional
+            Overrides cfg.lr_phase2 for this run when finetune_phase=2.
+            Ignored when finetune_phase=1 (phase 1 always uses
+            cfg.lr_generator by design). Leave as None to use
+            cfg.lr_phase2 unchanged.
         """
+        if finetune_phase not in (1, 2):
+            raise ValueError(f"finetune_phase must be 1 or 2, got {finetune_phase}")
+
         log.info(
             "Loading weights ONLY (fresh optimizer/scheduler/epoch count) from %s",
             ckpt_path,
@@ -712,11 +841,64 @@ class PUWDMTrainer:
         ema_state = ck.get("ema_state")
         if ema_state is not None and getattr(self.model, "_ema", None) is not None:
             self.model._ema.shadow = ema_state
+
+        self._weights_only_phase = finetune_phase
+        self._weights_only_lr = finetune_lr
         log.info(
-            "Loaded weights from source checkpoint epoch %d; this run starts at epoch 1 "
-            "with a fresh LR schedule.",
+            "Loaded weights from source checkpoint epoch %d; this run starts at "
+            "epoch 1 in Phase %d with a fresh LR schedule (%s).",
             ck.get("epoch", -1),
+            finetune_phase,
+            f"lr={finetune_lr:.2e}" if finetune_lr is not None else "cfg default",
         )
+
+        # ── Post-load sanity smoke test ─────────────────────────────────
+        # Catch a bad load (shape mismatch silently absorbed by strict=
+        # False, wrong normalization, corrupted checkpoint, etc.) THIS
+        # epoch instead of discovering it only after 20 epochs of wasted
+        # GPU time and a full evaluate.py run. A freshly-loaded,
+        # already-converged denoiser should already show eps_pred std
+        # close to ~1.0 on a single batch, before any training step.
+        try:
+            eps_std = self._probe_eps_std()
+            log.info(
+                "Post-load smoke test: eps_pred std=%.4f on source weights "
+                "(expect ~0.9-1.1 for an already-converged checkpoint; "
+                "far from that range suggests a bad/partial weight load).",
+                eps_std,
+            )
+            if eps_std < 0.5:
+                log.warning(
+                    "⚠ eps_pred std=%.4f is well below the ~1.0 expected for "
+                    "converged weights (epoch %d source checkpoint). Verify "
+                    "the checkpoint path and model config before training "
+                    "further — this may indicate a bad weight load, not "
+                    "just normal phase-1-style noise-prediction warmup.",
+                    eps_std,
+                    ck.get("epoch", -1),
+                )
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            log.warning("Post-load smoke test failed to run: %s", exc)
+
+    @torch.no_grad()
+    def _probe_eps_std(self) -> float:
+        """Single-batch eps_pred std check, usable before the epoch loop
+        starts (i.e. without an epoch number to log against)."""
+        self.model.eval()
+        batch = next(iter(self.val_loader))
+        device, dtype = self.device, self.dtype
+        with torch.autocast(device_type="cuda", dtype=dtype, enabled=self.cfg.use_amp):
+            step_out = self.model.training_step(
+                {
+                    "raw": batch["raw"].to(device),
+                    "reference": batch["reference"].to(device),
+                    "ambient": batch["ambient"].to(device),
+                    "transmission": batch["transmission"].to(device),
+                    "degradation": batch["degradation"].to(device),
+                    "severity": batch["severity"].to(device),
+                }
+            )
+        return step_out["noise_pred"].float().std().item()
 
     # ------------------------------------------------------------------
     # Main fit loop
@@ -730,18 +912,49 @@ class PUWDMTrainer:
             log.info("Resuming from %s", resume_from)
             ck = torch.load(resume_from, map_location=self.device, weights_only=False)
             start_epoch = ck["epoch"] + 1
+            # Full resume: phase is determined purely by where the
+            # checkpoint's epoch count sits relative to phase1_epochs.
+            # _load_checkpoint_state() below restores the exact saved
+            # optimizer/scheduler state anyway, so whichever schedule
+            # _enter_phase*() builds here is immediately overwritten for
+            # anything that matters.
+            phase = 2 if start_epoch > cfg.phase1_epochs else 1
         else:
             start_epoch = 1
-        log.info("Starting from epoch %d", start_epoch)
+            # FIX: previously this branch always fell through to
+            # `phase = 1`, so any load_weights_from(...) call — regardless
+            # of how far the source checkpoint had already been trained —
+            # silently restarted Phase 1's from-scratch diffusion-only
+            # loss + lr=cfg.lr_generator optimizer on top of the loaded
+            # weights. That combination caused a confirmed catastrophic
+            # regression (PSNR 18.26 -> 12.57 dB in 20 epochs) when RCC
+            # was added to an already phase-2/3-converged checkpoint this
+            # way. load_weights_from() now records the phase/LR the
+            # caller actually asked for (defaulting to the safe Phase 2
+            # fine-tune schedule) in self._weights_only_phase/_lr; honor
+            # it here instead of assuming Phase 1.
+            phase = (
+                self._weights_only_phase if self._weights_only_phase is not None else 1
+            )
+
+        log.info("Starting from epoch %d (phase %d)", start_epoch, phase)
 
         # Build the phase-appropriate optimizer LR / scheduler shape FIRST,
         # then load checkpoint state into it (see _load_checkpoint_state
         # docstring for why this order matters).
-        phase = 2 if start_epoch > cfg.phase1_epochs else 1
         if phase == 1:
             self._enter_phase1()
         else:
-            self._enter_phase2()
+            weights_only_start = ck is None and self._weights_only_phase is not None
+            self._enter_phase2(
+                lr_override=self._weights_only_lr if weights_only_start else None,
+                # A weights-only fresh start skips phase 1 entirely, so its
+                # remaining budget is the FULL total_epochs, not
+                # total_epochs - phase1_epochs (which would silently
+                # truncate the cosine schedule and leave most of training
+                # pinned at eta_min). See _enter_phase2's docstring.
+                remaining_epochs=cfg.total_epochs if weights_only_start else None,
+            )
 
         if ck is not None:
             self._load_checkpoint_state(ck)
