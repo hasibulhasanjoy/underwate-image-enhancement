@@ -85,7 +85,7 @@ from src.data.physics_dataset import (
     PhysicsDataModuleConfig,
     PhysicsDatasetConfig,
 )
-from src.losses.composite import CompositeLoss, LossWeights
+from src.losses.composite import CompositeLoss, LossWeights, LOW_T_THRESHOLD
 from src.models.p_uwdm import PUWDM, PUWDMConfig
 
 log = logging.getLogger(__name__)
@@ -574,17 +574,43 @@ class PUWDMTrainer:
 
         B = raw.size(0)
 
+        step_in = {
+            "raw": raw,
+            "reference": ref,
+            "ambient": ambient,
+            "transmission": transmission,
+            "degradation": degradation,
+            "severity": severity,
+        }
+
+        if self._rcc_only_mode:
+            # With the backbone frozen, noise_pred/diffusion_loss have no
+            # grad_fn at all (nothing upstream of them requires grad
+            # anymore) — RCC's ONLY gradient path is perceptual/histogram
+            # loss, which is itself gated to samples with t < LOW_T_THRESHOLD
+            # (see CompositeLoss). Under the normal full-range [0, T)
+            # timestep sampling, a batch has roughly a (1 - 200/1000)^B
+            # chance of drawing zero such samples (~41% at B=4) — on that
+            # batch, diffusion/perceptual/histogram are ALL constants with
+            # no grad_fn, total_loss.backward() has nothing to differentiate
+            # through, and PyTorch raises "element 0 of tensors does not
+            # require grad and does not have a grad_fn". This is exactly
+            # the crash from the first run's traceback.
+            #
+            # Fix: force every sampled timestep into [0, LOW_T_THRESHOLD)
+            # for the whole batch during RCC-only training. This isn't a
+            # workaround bolted on to dodge the crash — it's also the
+            # correct distribution to train RCC on: at inference (see
+            # PUWDM.sample()'s x0_correction_fn gating), RCC is ONLY ever
+            # applied when t < LOW_T_THRESHOLD in the first place, so
+            # training it on high-t x0 estimates it will never see applied
+            # to at inference would just be distribution mismatch — the
+            # same failure mode already documented for applying RCC at all
+            # 50 DDIM steps instead of gating it.
+            step_in["t"] = torch.randint(0, LOW_T_THRESHOLD, (B,), device=device)
+
         with torch.autocast(device_type="cuda", dtype=dtype, enabled=self.cfg.use_amp):
-            step_out = self.model.training_step(
-                {
-                    "raw": raw,
-                    "reference": ref,
-                    "ambient": ambient,
-                    "transmission": transmission,
-                    "degradation": degradation,
-                    "severity": severity,
-                }
-            )
+            step_out = self.model.training_step(step_in)
             loss_dict = self.criterion(
                 noise_pred=step_out["noise_pred"],
                 noise_target=step_out["noise_target"],
@@ -595,6 +621,28 @@ class PUWDMTrainer:
                 raw=raw,
             )
             g_loss = loss_dict["total"]
+
+        # Defensive safety net for RCC-only mode: forcing t into
+        # [0, LOW_T_THRESHOLD) above should make this unreachable (it's
+        # exactly what caused the original crash), but if some other edge
+        # case ever produces a loss with no grad_fn (e.g. red_comp
+        # accidentally left frozen), skip this batch's backward/step
+        # instead of crashing a run that's hours into training.
+        if self._rcc_only_mode and not g_loss.requires_grad:
+            log.warning(
+                "RCC-only step produced a loss with no grad_fn "
+                "(low_t_count=%s, total=%.4f) — skipping this batch's "
+                "backward/optimizer step rather than crashing. This should "
+                "not happen given the forced low-t sampling above; if it "
+                "recurs, verify red_comp is actually unfrozen "
+                "(load_weights_for_rcc_only should have handled this).",
+                loss_dict.get("low_t_count"),
+                g_loss.item(),
+            )
+            return {
+                k: v.item() if isinstance(v, torch.Tensor) else v
+                for k, v in loss_dict.items()
+            }
 
         # Generator update
         self.opt_g.zero_grad(set_to_none=True)
