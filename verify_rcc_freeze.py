@@ -4,7 +4,10 @@ verify_rcc_freeze.py — one-batch empirical smoke test for the RCC-only
 fine-tune setup. Run this BEFORE launching the real (many-hour) run.
 
 It loads the source checkpoint, freezes the backbone exactly the way
-train.py --train_rcc_only does, runs ONE real training step, and asserts:
+train.py --train_rcc_only does, runs ONE real training step through the
+actual trainer._train_step() code path (the same one the real run uses,
+including its forced low-t timestep sampling for RCC-only mode), and
+asserts:
 
   1. Every backbone (cond_nets + denoiser) parameter got NO gradient
      (.grad is None) AND its VALUES are bit-identical before/after the
@@ -12,14 +15,9 @@ train.py --train_rcc_only does, runs ONE real training step, and asserts:
      something slipping through.
   2. Every RCC (red_comp) parameter got a gradient, and RCC as a whole
      is not stuck at exactly zero gradient everywhere.
-
-The single batch's diffusion timestep is FORCED to t=0 for every sample
-(bypassing the trainer's normal random t sampling, for this smoke test
-only) so perceptual/histogram loss — RCC's only gradient path — is
-guaranteed to be active on this batch. Without this, a batch could
-randomly draw zero low-t (t<200) samples (~41% chance at batch_size=4)
-and this test would report a false failure ("RCC got no gradient") that
-has nothing to do with whether the freeze itself is correct.
+  3. low_t_count == batch_size, confirming the forced-low-t sampling
+     (added to fix the "does not require grad and does not have a
+     grad_fn" crash) is actually active.
 
 Exits 0 and prints "ALL CHECKS PASSED" only if every assertion holds.
 Any failure raises AssertionError with a clear message — do not launch
@@ -56,6 +54,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--init_weights_from", required=True)
     ap.add_argument("--data_root", default="dataset/UIEB")
+    ap.add_argument("--use_lsui", action="store_true")
+    ap.add_argument("--lsui_raw_dir", default="dataset/LSUI/input")
+    ap.add_argument("--lsui_ref_dir", default="dataset/LSUI/GT")
     ap.add_argument("--lr_rcc_only", type=float, default=3e-4)
     ap.add_argument(
         "--rcc_loss_mode", choices=["full", "perceptual_only"], default="full"
@@ -72,7 +73,7 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    cfg = TrainerConfig(
+    cfg_kwargs = dict(
         data_root=args.data_root,
         checkpoint_dir="/tmp/verify_rcc_freeze_ckpt",
         log_dir="/tmp/verify_rcc_freeze_runs",
@@ -80,6 +81,13 @@ def main() -> None:
         compile_model=not args.no_compile,
         model=PUWDMConfig(use_red_channel_compensation=True),
     )
+    if args.use_lsui:
+        cfg_kwargs.update(
+            use_lsui=True,
+            lsui_raw_dir=args.lsui_raw_dir,
+            lsui_ref_dir=args.lsui_ref_dir,
+        )
+    cfg = TrainerConfig(**cfg_kwargs)
 
     log.info("Building trainer (this also builds the model + data loaders)...")
     trainer = PUWDMTrainer(cfg)
@@ -110,60 +118,34 @@ def main() -> None:
         len(rcc_params),
     )
 
-    # ── One real training step, with t FORCED to 0 for every sample so ──
-    # perceptual/histogram loss (RCC's only gradient path) is guaranteed
-    # active — see module docstring for why this matters.
-    device, dtype = trainer.device, trainer.dtype
+    # ── One real training step through the ACTUAL trainer._train_step() ──
+    # code path — same one the real run uses, including its forced
+    # low-t timestep sampling for RCC-only mode (added to fix the
+    # "does not require grad and does not have a grad_fn" crash: without
+    # it, a batch has a real chance of drawing zero t<200 samples, at
+    # which point diffusion/perceptual/histogram are all grad-less
+    # constants and backward() has nothing to differentiate through).
     batch = next(iter(trainer.train_loader))
     B = batch["raw"].shape[0]
-    forced_t = torch.zeros(B, dtype=torch.long, device=device)
 
-    trainer.model.train()
-    with torch.autocast(device_type="cuda", dtype=dtype, enabled=cfg.use_amp):
-        step_out = trainer.model.training_step(
-            {
-                "raw": batch["raw"].to(device),
-                "reference": batch["reference"].to(device),
-                "ambient": batch["ambient"].to(device),
-                "transmission": batch["transmission"].to(device),
-                "degradation": batch["degradation"].to(device),
-                "severity": batch["severity"].to(device),
-                "t": forced_t,
-            }
-        )
-        loss_dict = trainer.criterion(
-            noise_pred=step_out["noise_pred"],
-            noise_target=step_out["noise_target"],
-            timesteps=step_out["timesteps"],
-            alphas_cumprod=step_out["alphas_cumprod"],
-            enhanced=step_out["enhanced"],
-            reference=batch["reference"].to(device),
-            raw=batch["raw"].to(device),
-        )
-        g_loss = loss_dict["total"]
+    step_losses = trainer._train_step(batch, phase=3)
 
     log.info(
-        "Forced-low-t step losses: total=%.4f diff=%.4f perc=%.4f hist=%.4f "
-        "(low_t_count=%d/%d, should be %d/%d since t is forced to 0)",
-        g_loss.item(),
-        loss_dict["diffusion"].item(),
-        loss_dict["perceptual"].item(),
-        loss_dict["histogram"].item(),
-        loss_dict["low_t_count"],
-        B,
-        B,
+        "Step losses: total=%.4f diff=%.4f perc=%.4f hist=%.4f " "low_t_count=%s/%d",
+        step_losses.get("total", float("nan")),
+        step_losses.get("diffusion", float("nan")),
+        step_losses.get("perceptual", float("nan")),
+        step_losses.get("histogram", float("nan")),
+        step_losses.get("low_t_count", "?"),
         B,
     )
-    assert loss_dict["low_t_count"] == B, (
-        f"Expected all {B} samples to count as low-t (t forced to 0), got "
-        f"{loss_dict['low_t_count']}. Something is wrong with the forced-t "
-        f"override or the low-t gate — investigate before trusting the "
+    assert step_losses.get("low_t_count") == B, (
+        f"Expected low_t_count == batch_size ({B}) thanks to the forced "
+        f"low-t sampling in RCC-only mode, got "
+        f"{step_losses.get('low_t_count')!r}. The forced-t override isn't "
+        f"active — investigate trainer._train_step() before trusting the "
         f"rest of this test."
     )
-
-    trainer.opt_g.zero_grad(set_to_none=True)
-    g_loss.backward()
-    trainer.opt_g.step()
 
     # ── Check 1: backbone got NO gradient and DID NOT move ──────────────
     for name, p in backbone_params:
