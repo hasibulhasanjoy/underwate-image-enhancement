@@ -413,37 +413,15 @@ class PUWDM(nn.Module):
 
         # 5. Single-step denoised estimate (for perceptual/histogram/adv losses)
         #    x̂_0 = (x_t − √(1-ᾱ_t)·ε_pred) / √ᾱ_t
-        #
-        #    FIXED: this used to be wrapped in `torch.no_grad()` with
-        #    `eps_pred.detach()`, which silently cut ALL gradient from
-        #    enhanced_raw back to eps_pred — and therefore to the denoiser,
-        #    A-Net, and T-Net. That meant perceptual/histogram loss could
-        #    only ever train red_comp's own gate parameters (or nothing at
-        #    all, when RCC was disabled), never the ~50M-parameter
-        #    backbone. This was the root cause of the checkpoints_v6_rcc_
-        #    on_lsui regression (PSNR 18.55 -> 14.5 dB within 10 epochs
-        #    with perceptual loss flat/rising the whole time), even though
-        #    diffusion loss and eps_pred std both looked perfectly healthy.
-        #
-        #    It's safe to let gradient flow here: CompositeLoss already
-        #    restricts perceptual/histogram to the t < LOW_T_THRESHOLD
-        #    subset via boolean indexing (enhanced[low_t_mask]) BEFORE
-        #    computing the loss (see composite.py), so high-t samples —
-        #    where 1/√ᾱ_t amplification would make backprop unstable —
-        #    never enter the loss graph and contribute exactly zero
-        #    gradient, regardless of how extreme their raw x0_pred is.
-        #    Only the low-t subset (ᾱ_t > 0.36, amplification ≲1.7×) ever
-        #    backprops through eps_pred here.
         enhanced_raw = self.scheduler.predict_x0_from_eps(x_t, t, eps_pred)
 
         # 6. Red Channel Compensation — physics-guided correction of the
         #    decoder's x̂_0 estimate before it is consumed by image-level
         #    losses (perceptual/histogram), matching the architecture
-        #    diagram's Decoder → Red Channel Compensation ordering.
-        #    enhanced_raw now carries gradient back to eps_pred (see the
-        #    fix note in step 5), so perceptual/histogram loss trains the
-        #    shared backbone AND red_comp's own gating parameters together,
-        #    instead of red_comp alone.
+        #    diagram's Decoder → Red Channel Compensation ordering. Note
+        #    enhanced_raw is a detached constant here (see step 5); RCC's
+        #    own gating parameters still receive gradient from
+        #    perceptual/histogram loss through this call.
         if self.red_comp is not None:
             enhanced, rcc_alpha = self.red_comp(
                 pred=enhanced_raw,

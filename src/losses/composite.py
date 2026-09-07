@@ -87,6 +87,27 @@ class LossWeights:
             contrastive=0.0,
         )
 
+    @classmethod
+    def rcc_only_perceptual(cls) -> "LossWeights":
+        """
+        RCC-only fine-tuning (frozen backbone), histogram loss dropped.
+
+        Same as phase2() but with histogram=0.0. Use this to isolate
+        whether histogram loss specifically (as opposed to perceptual
+        loss) is the destabilising term when fine-tuning RCC — diffusion
+        loss alone is NOT an option here (see
+        PUWDMTrainer.load_weights_for_rcc_only()'s docstring: RCC's
+        output never feeds the diffusion loss, so removing perceptual
+        AND histogram would give RCC exactly zero gradient).
+        """
+        return cls(
+            diffusion=1.0,
+            adversarial=0.0,
+            perceptual=0.05,
+            histogram=0.0,
+            contrastive=0.0,
+        )
+
 
 # Timestep threshold below which x0_pred is meaningful for image-level losses.
 # At t < LOW_T_THRESHOLD, ᾱ_t > 0.36, so x0_pred has reasonable signal.

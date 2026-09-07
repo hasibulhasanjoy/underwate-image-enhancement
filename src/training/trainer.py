@@ -128,6 +128,21 @@ class TrainerConfig:
     phase2_warmup_epochs: int = 5
     reset_optimizer_on_phase2: bool = True
 
+    # ── RCC-only fine-tuning (frozen backbone) ──────────────────────────────
+    # Fallback path after joint fine-tuning (checkpoints_v6_rcc_on_lsui_v3)
+    # regressed PSNR/SSIM below the checkpoints_v2_full_lsui/epoch_0300.pt
+    # starting point within 10 epochs. Freezing cond_nets + denoiser makes
+    # the catastrophic-forgetting failure mode documented in
+    # load_weights_from()'s docstring structurally impossible: only RCC's
+    # own ~few-thousand parameters can move. See
+    # PUWDMTrainer.load_weights_for_rcc_only() for full detail, including
+    # a critical gradient-path caveat around diffusion-only loss.
+    lr_rcc_only: float = (
+        3e-4  # RCC is tiny + freshly initialised: safe to push higher than lr_phase2
+    )
+    rcc_only_warmup_epochs: int = 5
+    rcc_loss_mode: str = "full"  # "full" | "perceptual_only" (see LossWeights)
+
     # ── data ───────────────────────────────────────────────────────────────
     batch_size: int = 16
     num_workers: int = 8
@@ -275,6 +290,13 @@ class PUWDMTrainer:
         # epochs when this happened).
         self._weights_only_phase: Optional[int] = None
         self._weights_only_lr: Optional[float] = None
+
+        # Set by load_weights_for_rcc_only() to tell fit() that the
+        # backbone (cond_nets + denoiser) is frozen, only RCC is
+        # trainable, and the optimizer/scheduler/criterion have already
+        # been fully configured for this run — fit() should NOT run its
+        # normal phase-1/phase-2 selection logic in that case.
+        self._rcc_only_mode: bool = False
 
     # ------------------------------------------------------------------
     # Build helpers
@@ -880,6 +902,223 @@ class PUWDMTrainer:
         except Exception as exc:  # pragma: no cover - diagnostic only
             log.warning("Post-load smoke test failed to run: %s", exc)
 
+    def _unwrap_model(self) -> PUWDM:
+        """Return the underlying PUWDM, unwrapping torch.compile()'s
+        OptimizedModule wrapper if present (attribute access on the
+        wrapper is proxied to the original module, but we need the
+        actual sub-modules — cond_nets/denoiser/red_comp — as real
+        nn.Module objects to freeze/unfreeze them and to collect
+        red_comp.parameters() for a filtered optimizer)."""
+        return getattr(self.model, "_orig_mod", self.model)
+
+    def load_weights_for_rcc_only(
+        self,
+        ckpt_path: str,
+        lr_override: Optional[float] = None,
+        loss_mode: Optional[str] = None,
+    ) -> None:
+        """
+        Load backbone weights from ``ckpt_path`` and freeze EVERYTHING
+        except the Red Channel Compensation (RCC) module — only RCC's own
+        parameters are trainable for the rest of this run.
+
+        Why this exists
+        ----------------
+        The v6 joint fine-tune (checkpoints_v6_rcc_on_lsui_v3), which let
+        gradients flow into the shared denoiser + cond_nets as well as
+        RCC, regressed PSNR/SSIM below its own starting checkpoint
+        (checkpoints_v2_full_lsui/epoch_0300.pt: PSNR 18.76 dB / SSIM
+        0.803) within just 10 epochs (epoch_0010: PSNR 16.01 dB / SSIM
+        0.706 with RCC off, 17.01 dB / 0.750 with RCC on). That is the
+        same catastrophic-forgetting failure mode already documented in
+        load_weights_from()'s docstring: perturbing an already-converged
+        denoiser with fresh gradients from a different loss composition.
+        Freezing cond_nets + denoiser here makes that failure mode
+        structurally impossible — whatever loss is applied, only RCC's
+        own ~few-thousand parameters can move, so the backbone cannot
+        regress.
+
+        CRITICAL gradient-path caveat — read before choosing loss_mode
+        ----------------------------------------------------------------
+        RCC's output (``enhanced``) does NOT feed the diffusion loss.
+        Diffusion loss is computed purely from noise_pred vs noise_target
+        (see CompositeLoss.forward() / p_uwdm.py training_step) — a
+        computation that happens entirely upstream of, and independent
+        from, RCC. RCC is only ever updated through the perceptual and/or
+        histogram losses, which are computed on ``enhanced`` (RCC's
+        output) vs ``reference``. Concretely: with the backbone frozen,
+        a diffusion-only loss configuration gives RCC's parameters
+        EXACTLY ZERO gradient, every single step — this is not a gentler
+        version of RCC training, it is a no-op that would silently burn
+        GPU time while RCC's weights never move at all (you'd see the
+        diffusion loss value logged as normal, which could easily be
+        mistaken for training happening). Because of this, "diffusion
+        only" is intentionally not an accepted loss_mode here.
+
+        Parameters
+        ----------
+        ckpt_path : str
+            Source checkpoint to load backbone weights from. Use a
+            checkpoint that predates RCC entirely (e.g.
+            checkpoints_v2_full_lsui/epoch_0300.pt) so RCC starts from
+            its random init against a known-good, non-degraded backbone
+            — NOT a checkpoint from the v6 run, which has already been
+            perturbed by joint fine-tuning.
+        lr_override : float, optional
+            Overrides cfg.lr_rcc_only. RCC is tiny and freshly
+            initialised, so a higher LR than normal backbone fine-tuning
+            (1e-4 to 1e-3) is safe and recommended precisely because the
+            backbone can no longer be damaged by it.
+        loss_mode : {"full", "perceptual_only"}, optional
+            Overrides cfg.rcc_loss_mode.
+              - "full" (default, recommended first choice): diffusion +
+                perceptual(0.05) + histogram(0.15) — the same weights as
+                the normal phase-2 preset. Safe here specifically because
+                the backbone is frozen, so the failure mode this
+                composition triggered in the shared denoiser during the
+                v6 run cannot recur.
+              - "perceptual_only": drops histogram loss (weight -> 0),
+                keeping perceptual(0.05). Use this only if you have a
+                specific reason to suspect histogram loss (rather than
+                perceptual loss) is the destabilising term for RCC —
+                e.g. to A/B against a "full" run's per-image results.
+        """
+        mode = loss_mode if loss_mode is not None else self.cfg.rcc_loss_mode
+        if mode not in ("full", "perceptual_only"):
+            raise ValueError(
+                f"Unknown loss_mode {mode!r}. Expected 'full' or "
+                "'perceptual_only' — 'diffusion_only' is intentionally not "
+                "supported here; see this method's docstring for why "
+                "(RCC would receive exactly zero gradient)."
+            )
+
+        log.info(
+            "Loading weights ONLY (fresh optimizer/scheduler/epoch count) "
+            "from %s for RCC-ONLY fine-tuning (backbone frozen).",
+            ckpt_path,
+        )
+        ck = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        # strict=False: tolerates loading a pre-RCC checkpoint (RCC keys
+        # simply reported missing -> RCC keeps its random init, which is
+        # exactly what we want here).
+        missing, unexpected = self.model.load_state_dict(
+            ck["model_state"], strict=False
+        )
+        if missing:
+            log.warning(
+                "Checkpoint missing %d model key(s) (RCC starting from "
+                "random init, as expected for a pre-RCC source "
+                "checkpoint): %s",
+                len(missing),
+                missing,
+            )
+        if unexpected:
+            log.warning(
+                "Checkpoint had %d unexpected model key(s), ignored: %s",
+                len(unexpected),
+                unexpected,
+            )
+        ema_state = ck.get("ema_state")
+        if ema_state is not None and getattr(self.model, "_ema", None) is not None:
+            self.model._ema.shadow = ema_state
+
+        core = self._unwrap_model()
+        if core.red_comp is None:
+            raise ValueError(
+                "Model was built with use_red_channel_compensation=False — "
+                "there is no RCC module to train. Rebuild the trainer "
+                "without --no_red_channel_compensation."
+            )
+
+        _freeze(core.cond_nets)
+        _freeze(core.denoiser)
+        _unfreeze(core.red_comp)
+
+        trainable = [p for p in core.red_comp.parameters() if p.requires_grad]
+        n_trainable = sum(p.numel() for p in trainable)
+        n_frozen = sum(p.numel() for p in core.parameters()) - n_trainable
+        log.info(
+            "RCC-only mode: %s trainable param(s) in red_comp, %s frozen "
+            "(cond_nets + denoiser).",
+            f"{n_trainable:,}",
+            f"{n_frozen:,}",
+        )
+
+        lr = lr_override if lr_override is not None else self.cfg.lr_rcc_only
+        # Fresh optimizer over ONLY the trainable (RCC) parameters — the
+        # frozen backbone never enters opt_g at all, so there's no need
+        # to rely on requires_grad alone to keep it untouched.
+        self.opt_g = AdamW(
+            trainable,
+            lr=lr,
+            betas=self.cfg.betas,
+            weight_decay=self.cfg.weight_decay,
+        )
+
+        self.criterion.set_weights(
+            LossWeights.phase2()
+            if mode == "full"
+            else LossWeights.rcc_only_perceptual()
+        )
+
+        remaining = self.cfg.total_epochs
+        warmup = min(self.cfg.rcc_only_warmup_epochs, max(remaining - 1, 0))
+        if warmup > 0:
+            self.sched_g = SequentialLR(
+                self.opt_g,
+                schedulers=[
+                    LinearLR(
+                        self.opt_g,
+                        start_factor=0.1,
+                        end_factor=1.0,
+                        total_iters=warmup,
+                    ),
+                    CosineAnnealingLR(
+                        self.opt_g, T_max=max(remaining - warmup, 1), eta_min=1e-6
+                    ),
+                ],
+                milestones=[warmup],
+            )
+        else:
+            self.sched_g = CosineAnnealingLR(self.opt_g, T_max=remaining, eta_min=1e-6)
+
+        self._rcc_only_mode = True
+        log.info(
+            "RCC-only fine-tune ready: lr=%.2e over %d epochs (warmup=%d), "
+            "loss_mode=%s (histogram %s).",
+            lr,
+            remaining,
+            warmup,
+            mode,
+            "enabled" if mode == "full" else "DISABLED",
+        )
+
+        # ── Post-load sanity smoke test ─────────────────────────────────
+        # The backbone is frozen, so this value should already be close
+        # to ~1.0 (whatever the source checkpoint's converged std was)
+        # and — unlike the normal weights-only path — is EXPECTED to stay
+        # exactly there for the entire run, since nothing upstream of
+        # eps_pred can change anymore.
+        try:
+            eps_std = self._probe_eps_std()
+            log.info(
+                "Post-load smoke test: eps_pred std=%.4f on source weights "
+                "(backbone frozen — this value will NOT move for the rest "
+                "of this run; that's expected, not a bug).",
+                eps_std,
+            )
+            if eps_std < 0.5:
+                log.warning(
+                    "⚠ eps_pred std=%.4f is well below the ~1.0 expected for "
+                    "a converged checkpoint. Verify ckpt_path before "
+                    "training further — this suggests a bad/partial "
+                    "weight load, not something RCC-only training can fix "
+                    "(RCC never touches eps_pred).",
+                    eps_std,
+                )
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            log.warning("Post-load smoke test failed to run: %s", exc)
+
     @torch.no_grad()
     def _probe_eps_std(self) -> float:
         """Single-batch eps_pred std check, usable before the epoch loop
@@ -908,7 +1147,25 @@ class PUWDMTrainer:
         cfg = self.cfg
 
         ck = None
-        if resume_from is not None:
+        if self._rcc_only_mode:
+            if resume_from is not None:
+                raise ValueError(
+                    "resume_from is not supported together with RCC-only "
+                    "mode. load_weights_for_rcc_only() always starts a "
+                    "fresh run at epoch 1 with its own optimizer/scheduler/"
+                    "criterion; call it, then fit(resume_from=None)."
+                )
+            start_epoch = 1
+            phase = 3  # sentinel: RCC-only. Optimizer/scheduler/criterion
+            # were already fully configured by load_weights_for_rcc_only();
+            # deliberately skip the phase 1/2 selection below, which would
+            # rebuild opt_g over ALL model parameters and stomp the frozen
+            # backbone / RCC-only optimizer.
+            log.info(
+                "Starting RCC-only fine-tune from epoch 1 (backbone frozen; "
+                "optimizer/scheduler/loss already configured)."
+            )
+        elif resume_from is not None:
             log.info("Resuming from %s", resume_from)
             ck = torch.load(resume_from, map_location=self.device, weights_only=False)
             start_epoch = ck["epoch"] + 1
@@ -942,7 +1199,16 @@ class PUWDMTrainer:
         # Build the phase-appropriate optimizer LR / scheduler shape FIRST,
         # then load checkpoint state into it (see _load_checkpoint_state
         # docstring for why this order matters).
-        if phase == 1:
+        if phase == 3:
+            # RCC-only: opt_g/sched_g/criterion were already fully built by
+            # load_weights_for_rcc_only() over ONLY red_comp's parameters.
+            # Calling _enter_phase1()/_enter_phase2() here would rebuild
+            # opt_g over self.model.parameters() (i.e. the whole model,
+            # including the backbone we just froze) and reset the
+            # criterion back to a phase preset — silently undoing the
+            # freeze. Deliberately do nothing here.
+            pass
+        elif phase == 1:
             self._enter_phase1()
         else:
             weights_only_start = ck is None and self._weights_only_phase is not None

@@ -34,6 +34,25 @@ Three modes, all through this one script:
    already-converged checkpoint if used by mistake — see trainer.py's
    load_weights_from() docstring, item 8 in the module header).
 
+4. RCC-only fine-tune (freeze cond_nets + denoiser, train ONLY the Red
+   Channel Compensation module — the fallback path after joint
+   fine-tuning regressed PSNR/SSIM below its own starting checkpoint):
+       python train.py --init_weights_from checkpoints_v2_full_lsui/epoch_0300.pt \\
+           --train_rcc_only \\
+           --checkpoint_dir checkpoints_v7_rcc_only \\
+           --log_dir runs/p_uwdm_v7_rcc_only \\
+           --total_epochs 60 --lr_rcc_only 3e-4
+
+   IMPORTANT: start this from a checkpoint that predates RCC entirely
+   (e.g. checkpoints_v2_full_lsui/epoch_0300.pt) — NOT from a v6-run
+   checkpoint, whose backbone has already been perturbed by joint
+   fine-tuning. --finetune_phase/--finetune_lr do not apply in this
+   mode (RCC-only has its own --lr_rcc_only / --rcc_loss_mode). See
+   PUWDMTrainer.load_weights_for_rcc_only()'s docstring for why
+   "diffusion only" is not offered as a --rcc_loss_mode: RCC's output
+   never feeds the diffusion loss, so that combination would give RCC
+   exactly zero gradient.
+
 Examples for the shared-GPU / small-VRAM case:
     python train.py --batch_size 8             # smaller batch (shared GPU)
 
@@ -191,6 +210,53 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    # Mode: RCC-only fine-tune (freeze backbone, train only RCC) — the
+    # fallback path after joint fine-tuning of the backbone + RCC together
+    # regressed PSNR/SSIM below the source checkpoint.
+    p.add_argument(
+        "--train_rcc_only",
+        action="store_true",
+        help=(
+            "Freeze cond_nets + denoiser and train ONLY the Red Channel "
+            "Compensation (RCC) module, starting from --init_weights_from. "
+            "Requires --init_weights_from; mutually exclusive with "
+            "--resume/--checkpoint/--finetune_phase/--finetune_lr (RCC-only "
+            "has its own --lr_rcc_only / --rcc_loss_mode instead)."
+        ),
+    )
+    p.add_argument(
+        "--lr_rcc_only",
+        type=float,
+        default=3e-4,
+        help=(
+            "LR for RCC-only fine-tuning. Only RCC's own ~few-thousand "
+            "parameters are being optimized and the backbone is frozen "
+            "(so it cannot be damaged by this LR), so a notably higher LR "
+            "than normal backbone fine-tuning is safe and recommended: "
+            "1e-4 to 1e-3."
+        ),
+    )
+    p.add_argument("--rcc_only_warmup_epochs", type=int, default=5)
+    p.add_argument(
+        "--rcc_loss_mode",
+        choices=["full", "perceptual_only"],
+        default="full",
+        help=(
+            "Loss composition for --train_rcc_only. 'full' (default, "
+            "recommended): diffusion + perceptual(0.05) + histogram(0.15), "
+            "same weights as the normal phase-2 preset — safe here "
+            "specifically because the backbone is frozen, so the failure "
+            "mode that composition triggered in the shared denoiser during "
+            "joint fine-tuning cannot recur. 'perceptual_only' drops "
+            "histogram loss, for isolating whether histogram specifically "
+            "destabilises RCC. A 'diffusion_only' mode is intentionally "
+            "NOT offered: RCC's output never feeds the diffusion loss, so "
+            "that combination would give RCC exactly zero gradient every "
+            "step — see PUWDMTrainer.load_weights_for_rcc_only()'s "
+            "docstring."
+        ),
+    )
+
     args = p.parse_args()
 
     if args.init_weights_from and (args.resume or args.checkpoint):
@@ -200,7 +266,17 @@ def parse_args() -> argparse.Namespace:
             "--resume/--checkpoint to literally continue an interrupted run."
         )
 
-    if (
+    if args.train_rcc_only:
+        if not args.init_weights_from:
+            p.error("--train_rcc_only requires --init_weights_from <checkpoint>.")
+        if args.resume or args.checkpoint:
+            p.error("--train_rcc_only cannot be combined with --resume/--checkpoint.")
+        if args.finetune_phase != 2 or args.finetune_lr is not None:
+            p.error(
+                "--finetune_phase/--finetune_lr do not apply with "
+                "--train_rcc_only; use --lr_rcc_only/--rcc_loss_mode instead."
+            )
+    elif (
         args.finetune_phase != 2 or args.finetune_lr is not None
     ) and not args.init_weights_from:
         p.error("--finetune_phase/--finetune_lr only apply with --init_weights_from.")
@@ -229,6 +305,9 @@ def main() -> None:
         lr_phase2=args.lr_phase2,
         phase2_warmup_epochs=args.phase2_warmup_epochs,
         reset_optimizer_on_phase2=not args.no_reset_optimizer_phase2,
+        lr_rcc_only=args.lr_rcc_only,
+        rcc_only_warmup_epochs=args.rcc_only_warmup_epochs,
+        rcc_loss_mode=args.rcc_loss_mode,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         image_size=args.image_size,
@@ -249,6 +328,22 @@ def main() -> None:
     )
 
     trainer = PUWDMTrainer(cfg)
+
+    if args.train_rcc_only:
+        log.info(
+            "Mode: RCC-ONLY FINE-TUNE (backbone frozen) from %s — "
+            "lr_rcc_only=%.2e, rcc_loss_mode=%s",
+            args.init_weights_from,
+            args.lr_rcc_only,
+            args.rcc_loss_mode,
+        )
+        trainer.load_weights_for_rcc_only(
+            args.init_weights_from,
+            lr_override=args.lr_rcc_only,
+            loss_mode=args.rcc_loss_mode,
+        )
+        trainer.fit(resume_from=None)
+        return
 
     if args.init_weights_from:
         log.info(
